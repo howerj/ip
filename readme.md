@@ -12,9 +12,15 @@ To Do / Plan:
 * [ ] libpcap or TAP/TUN?
 * [ ] Headers for IPv4, IPv6, ICMP, UDP, TCP, ARP/NDP, DHCP, DNS, ...
 * [ ] UDP
+* [ ] DHCP, DHCP TLV option parsing
 * [ ] ICMP
 * [ ] TCP
 * [ ] Make a Unix Berkeley sockets API.
+* [ ] DNS Cache / Hosts file support
+* [ ] PPP
+* [ ] Other frame formats than ethernet
+* [ ] DHCP client and server
+* [ ] Default gateway, netmasks, routing, firewall, ...
 * [ ] Make an alternate more lower level API (e.g. callback on receipt of any
   packet, on UDP packet, etcetera).
 * [ ] Make a test bench, and way of creating corrupt packets for both
@@ -28,4 +34,5 @@ To Do / Plan:
   this UDP/IP stack.
 * [ ] port to <https://github.com/howerj/subleq-network>.
 * [ ] port to an OS of my own design?
-
+* [ ] Turn into header only library?
+* [ ] Make a VHDL version?

@@ -1,95 +1,18 @@
 #ifndef IP_H
 #define IP_H
-#define IP_PROJECT ""
+#define IP_PROJECT "Portable IP/TCP/UDP stack"
 #define IP_AUTHOR  "Richard James Howe"
 #define IP_EMAIL   "howe.r.j.89@gmail.com"
 #define IP_LICENSE "0BSD"
 #define IP_REPO    "https://github.com/howerj/ip"
 
 #include <stdint.h>
+#include <stddef.h>
 
-/*
-0
-  6 field eth-dest      ( 48 bit source address )
-  6 field eth-src       ( 48 bit destination address )
-  2 field eth-type      ( 16 bit type )
-constant #eth-frame
-
-0
-  2 field arp-hw        ( 16 bit hw type )
-  2 field arp-proto     ( 16 bit protocol )
-  1 field arp-hlen      (  8 bit hw address length )
-  1 field arp-plen      (  8 bit protocol address length )
-  2 field arp-op        ( 16 bit operation )
-  6 field arp-shw       ( 48 bit sender hw address )
-  4 field arp-sp        ( 32 bit sender ipv4 address )
-  6 field arp-thw       ( 48 bit target hw address )
-  4 field arp-tp        ( 32 bit target ipv4 address )
-constant #arp-message
-
-0
-  4 field ac-ip         ( 32 bit protocol address )
-  6 field ac-hw         ( 48 bit hw address )
-constant #arp-cache
-
-0
-  1 field ip-vhl     (  4 bit version and 4 bit header length )
-  1 field ip-tos        (  8 bit type of service )
-  2 field ip-len        ( 16 bit length )
-  2 field ip-id         ( 16 bit identification )
-  2 field ip-frags      (  3 bit flags 13 bit fragment offset )
-  1 field ip-ttl        (  8 bit time to live )
-  1 field ip-proto      (  8 bit protocol number )
-  2 field ip-checksum   ( 16 bit checksum )
-  4 field ip-source     ( 32 bit source address )
-  4 field ip-dest       ( 32 bit destination address )
-constant #ip-header
-: >ip #eth-frame #ip-header + ;
-
-0
-  1 field icmp-type     (  8 bits type )
-  1 field icmp-code     (  8 bits code )
-  2 field icmp-checksum ( 16 bits checksum )
-  4 field icmp-rest     ( 32 bits rest of header )
-constant #icmp-header
-
-0
-  2 field udp-source    ( 16 bit source port )
-  2 field udp-dest      ( 16 bit destination port )
-  2 field udp-len       ( 16 bit length )
-  2 field udp-checksum  ( 16 bit checksum )
-constant #udp-datagram
-: >udp >ip #udp-datagram + ; ( udp payload )
-
-0
-  2 field tcp-source    ( 16 bit source port )
-  2 field tcp-dest      ( 16 bit destination port )
-  4 field tcp-seq       ( 32 bit sequence number )
-  4 field tcp-ack       ( 32 bit acknowledgement )
-  1 field tcp-offset    (  8 bit offset )
-  2 field tcp-flags     ( 16 bit flags )
-  1 field tcp-window    (  8 bit window size )
-  2 field tcp-checksum  ( 16 bit checksum )
-  2 field tcp-urgent    ( 16 bit urgent pointer )
-constant #tcp-header
-: #tcp >ip #tcp-header + ;
-
-0
-  1 field ntp-livnm   ( 2-bit Leap, 3-bit version, 3-bit mode )
-  1 field ntp-stratum   ( Stratum [closeness to good clock] )
-  1 field ntp-poll      ( Poll field, max suggested poll rate )
-  1 field ntp-precision ( Precision [signed log2 seconds] )
-  4 field ntp-root-delay ( Root delay )
-  4 field ntp-root-dispersion ( Root dispersion )
-  4 field ntp-refid     ( Reference ID )
-  8 field ntp-ref-ts    ( Reference Time Stamp )
-  8 field ntp-orig-ts   ( Origin Time Stamp )
-  8 field ntp-rx-ts     ( RX Time Stamp )
-  8 field ntp-tx-ts     ( 8-byte Transmit time stamp )
-  \ There are more optional fields, of varying length, such
-  \ as key ids, message digests, auth, etcetera.
-constant #ntp-header
-*/
+/* NOTE: https://stackoverflow.com/questions/8568432 */
+#ifndef PACKED
+#define PACKED __attribute__((packed))
+#endif
 
 typedef struct {
 	uint8_t source[6];
@@ -97,28 +20,84 @@ typedef struct {
 	uint16_t type;
 } ethernet_t;
 
+#define ETHERNET_HEADER_BYTE_COUNT (14)
+
 typedef struct {
-	uint8_t pad;
+	uint8_t vhl;          /*  4 bit version and 4 bit header length */
+	uint8_t tos;          /*  8 bit type of service */
+	uint16_t len;         /* 16 bit length */
+	uint16_t id;          /* 16 bit identification */
+	uint16_t frags;       /*  3 bit flags 13 bit fragment offset */
+	uint8_t ttl;          /*  8 bit time to live */
+	uint8_t proto;        /*  8 bit protocol number */
+	uint16_t checksum;    /* 16 bit checksum */
+	uint32_t source;      /* 32 bit source address */
+	uint32_t destination; /* 32 bit destination address */
 } ipv4_t;
 
+#define IP_HEADER_BYTE_COUNT (20)
+
 typedef struct {
-	uint8_t pad;
+	uint16_t hw;     /* 16 bit hw type */
+	uint16_t proto;  /* 16 bit protocol */
+	uint8_t  hlen;   /*  8 bit hw address length */
+	uint8_t  plen;   /*  8 bit protocol address length */
+	uint16_t op;     /* 16 bit operation */
+	uint8_t  shw[6]; /* 48 bit sender hw address */
+	uint32_t sp;     /* 32 bit sender ipv4 address */
+	uint8_t  thw[6]; /* 48 bit target hw address */
+	uint32_t tp;     /* 32 bit target ipv4 address */
 } arp_t;
 
+#define ARP_HEADER_BYTE_COUNT (28)
+
 typedef struct {
-	uint8_t pad;
+	uint8_t  type;     /* 8 bits type */
+	uint8_t  code;     /*  8 bits code */
+	uint16_t checksum; /* 16 bits checksum */
+	uint32_t rest;     /* 32 bits rest of header */
 } icmp_t;
 
+#define ICMP_HEADER_BYTE_COUNT (8)
+
 typedef struct {
-	uint8_t pad;
+	uint16_t source;      /* 16 bit source port */
+	uint16_t destination; /* 16 bit destination port */
+	uint16_t length;      /* 16 bit length */
+	uint16_t checksum;    /* 16 bit checksum */
 } udp_t;
 
-typedef struct {
-	uint8_t pad;
-} tcp_t;
+#define UDP_HEADER_BYTE_COUNT (8)
 
 typedef struct {
-	uint8_t pad;
+	uint16_t source;      /* 16 bit source port */
+	uint16_t destination; /* 16 bit destination port */
+	uint32_t seq;         /* 32 bit sequence number */
+	uint32_t ack;         /* 32 bit acknowledgement */
+	uint8_t offset;       /*  8 bit offset */
+	uint16_t flags;       /* 16 bit flags */
+	uint8_t window;       /*  8 bit window size */
+	uint16_t checksum;    /* 16 bit checksum */
+	uint16_t urgent;      /* 16 bit urgent pointer */
+} tcp_t;
+
+#define TCP_HEADER_BYTE_COUNT (20)
+
+typedef struct {
+	uint8_t livnm;       /* 2-bit Leap, 3-bit version, 3-bit mode */
+	uint8_t stratum;     /* Stratum [closeness to good clock] */
+	uint8_t poll;        /* Poll field, max suggested poll rate */
+	uint8_t precision;   /* Precision [signed log2 seconds] */
+	uint32_t root_delay; /* Root delay */
+	uint32_t root_dispersion; /* Root dispersion */
+	uint32_t refid;      /* Reference ID */
+	uint64_t ref_ts;     /* Reference Time Stamp */
+	uint64_t orig_ts;    /* Origin Time Stamp */
+	uint64_t rx_ts;      /* RX Time Stamp */
+	uint64_t tx_ts;      /* 8-byte Transmit time stamp */
+	/* There are more optional fields, of varying length, such as key ids, message digests, auth, etcetera. */
 } ntp_t;
+
+#define NTP_HEADER_BYTE_COUNT (48)
 
 #endif

@@ -1,4 +1,4 @@
-CFLAGS=-Wall -Wextra -pedantic -O2 -std=c99
+CFLAGS=-Wall -Wextra -pedantic -O2 -std=gnu99
 TARGET=ip
 
 .PHONY: all default test run clean
