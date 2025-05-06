@@ -7,6 +7,10 @@
 
 An attempt at a IPv4 UDP/TCP stack.
 
+Note that functions, structures and variables will have the `ip_` prefix as
+that is the name of the library. (e.g. `ip_ethernet_tx` transmits an Ethernet
+frame, which is a separate layer which is independent of the IP protocol).
+
 To Do / Plan:
 
 * [ ] libpcap or TAP/TUN?
@@ -36,3 +40,5 @@ To Do / Plan:
 * [ ] port to an OS of my own design?
 * [ ] Turn into header only library?
 * [ ] Make a VHDL version?
+* [ ] Make a version in rust?
+* [ ] Add back in warnings for unused functions

@@ -10,17 +10,17 @@
 #include <stddef.h>
 
 /* NOTE: https://stackoverflow.com/questions/8568432 */
-#ifndef PACKED
-#define PACKED __attribute__((packed))
+#ifndef IP_PACKED
+#define IP_PACKED __attribute__((packed))
 #endif
 
 typedef struct {
 	uint8_t source[6];
 	uint8_t destination[6];
 	uint16_t type;
-} ethernet_t;
+} ip_ethernet_t;
 
-#define ETHERNET_HEADER_BYTE_COUNT (14)
+#define IP_ETHERNET_HEADER_BYTE_COUNT (14)
 
 typedef struct {
 	uint8_t vhl;          /*  4 bit version and 4 bit header length */
@@ -33,7 +33,7 @@ typedef struct {
 	uint16_t checksum;    /* 16 bit checksum */
 	uint32_t source;      /* 32 bit source address */
 	uint32_t destination; /* 32 bit destination address */
-} ipv4_t;
+} ip_ipv4_t;
 
 #define IP_HEADER_BYTE_COUNT (20)
 
@@ -47,27 +47,27 @@ typedef struct {
 	uint32_t sp;     /* 32 bit sender ipv4 address */
 	uint8_t  thw[6]; /* 48 bit target hw address */
 	uint32_t tp;     /* 32 bit target ipv4 address */
-} arp_t;
+} ip_arp_t;
 
-#define ARP_HEADER_BYTE_COUNT (28)
+#define IP_ARP_HEADER_BYTE_COUNT (28)
 
 typedef struct {
 	uint8_t  type;     /* 8 bits type */
 	uint8_t  code;     /*  8 bits code */
 	uint16_t checksum; /* 16 bits checksum */
 	uint32_t rest;     /* 32 bits rest of header */
-} icmp_t;
+} ip_icmp_t;
 
-#define ICMP_HEADER_BYTE_COUNT (8)
+#define IP_ICMP_HEADER_BYTE_COUNT (8)
 
 typedef struct {
 	uint16_t source;      /* 16 bit source port */
 	uint16_t destination; /* 16 bit destination port */
 	uint16_t length;      /* 16 bit length */
 	uint16_t checksum;    /* 16 bit checksum */
-} udp_t;
+} ip_udp_t;
 
-#define UDP_HEADER_BYTE_COUNT (8)
+#define IP_UDP_HEADER_BYTE_COUNT (8)
 
 typedef struct {
 	uint16_t source;      /* 16 bit source port */
@@ -79,9 +79,9 @@ typedef struct {
 	uint8_t window;       /*  8 bit window size */
 	uint16_t checksum;    /* 16 bit checksum */
 	uint16_t urgent;      /* 16 bit urgent pointer */
-} tcp_t;
+} ip_tcp_t;
 
-#define TCP_HEADER_BYTE_COUNT (20)
+#define IP_TCP_HEADER_BYTE_COUNT (20)
 
 typedef struct {
 	uint8_t livnm;       /* 2-bit Leap, 3-bit version, 3-bit mode */
@@ -96,8 +96,8 @@ typedef struct {
 	uint64_t rx_ts;      /* RX Time Stamp */
 	uint64_t tx_ts;      /* 8-byte Transmit time stamp */
 	/* There are more optional fields, of varying length, such as key ids, message digests, auth, etcetera. */
-} ntp_t;
+} ip_ntp_t;
 
-#define NTP_HEADER_BYTE_COUNT (48)
+#define IP_NTP_HEADER_BYTE_COUNT (48)
 
 #endif
