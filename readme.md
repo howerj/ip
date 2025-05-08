@@ -42,3 +42,9 @@ To Do / Plan:
 * [ ] Make a VHDL version?
 * [ ] Make a version in rust?
 * [ ] Add back in warnings for unused functions
+* It would be a neat idea to make the TCP functionality separate from the
+rest of the stack, and independent of the TCP header, this would allow the
+TCP algorithms, which are very useful in themselves, to be used in other custom
+protocols, or without the overhead of Ethernet (for example, TCP over a fast
+serial line). Allowing the protocol to be more customizable even if it breaks
+compatibility would be useful (by disabling algorithms selectively).

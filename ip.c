@@ -1,19 +1,29 @@
 #include "ip.h"
 #include <assert.h>
-#include <stdio.h>
+#include <limits.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef CONFIG_IP_ARP_CACHE_COUNT
 #define CONFIG_IP_ARP_CACHE_COUNT (64)
 #endif
 
+#ifdef NDEBUG
+#define IP_DEBUG (0)
+#else
+#define IP_DEBUG (1)
+#endif
+
+#define IP_UNUSED(X) ((void)(X))
+
 typedef struct {
 	uint8_t mac[6];
 	uint32_t ipv4;
 	int state, ttl_ms;
-} arp_cache_entry_t;
+} ip_arp_cache_entry_t;
 
 typedef struct {
 	int (*os_time_ms)(void *os_time, long *time_ms);
@@ -27,7 +37,7 @@ typedef struct {
 	uint32_t ipv4_interface, ipv4_default_gateway;
 	uint8_t mac[6];
 
-	arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
+	ip_arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
 
 	int fatal; /* fatal error occurred, we should exit gracefully */
 	unsigned log_level; /* level to log at */
@@ -56,6 +66,24 @@ static inline uint16_t ip_ntohs(uint16_t x) { return ip_endianess() ? x : ip_u16
 static inline uint32_t ip_ntohl(uint16_t x) { return ip_endianess() ? x : ip_u32swap(x); }
 static inline uint16_t ip_htons(uint16_t x) { return ip_endianess() ? x : ip_u16swap(x); }
 static inline uint32_t ip_htonl(uint32_t x) { return ip_endianess() ? x : ip_u32swap(x); }
+
+static int ip_v4addr(const char *s, uint32_t *addr) {
+	assert(s);
+	assert(addr);
+	*addr = 0;
+	int ip[4] = { 0, };
+	const int r = sscanf(s, "%i.%i.%i.%i", &ip[0], &ip[1], &ip[2], &ip[3]);
+	if (r != 4)
+		return -1;
+	const uint32_t ipv4 = 
+		((ip[0] & 255) << 24) | 
+		((ip[1] & 255) << 16) | 
+		((ip[2] & 255) <<  8) | 
+		((ip[3] & 255) <<  0) ; 
+	*addr = ipv4;
+	return 0;
+}
+
 
 // TODO: Check / unit test these functions
 static inline void ip_htons_b(uint16_t x, uint8_t *buf) {
@@ -92,6 +120,8 @@ static inline uint32_t ip_ntohl_b(const uint8_t *buf) {
 	return ip_htonl(x);
 }
 
+// TODO: Option to print if `serialize` is negative, need to pass in print
+// object however.
 static inline void ip_u8_buf_serdes(uint8_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
@@ -132,7 +162,7 @@ static inline void ip_memory_serdes(uint8_t *structure, uint8_t *network, size_t
 	memcpy(structure, network, length);
 }
 
-int ip_ethernet_header_serdes(ip_ethernet_t *e, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_ethernet_header_serdes(ip_ethernet_t *e, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(e);
 	assert(buf);
 	if (buf_len < IP_ETHERNET_HEADER_BYTE_COUNT)
@@ -146,7 +176,7 @@ int ip_ethernet_header_serdes(ip_ethernet_t *e, uint8_t *buf, size_t buf_len, in
 	return IP_ETHERNET_HEADER_BYTE_COUNT;
 }
 
-int ip_ipv4_header_serdes(ip_ipv4_t *i, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_ipv4_header_serdes(ip_ipv4_t *i, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(i);
 	assert(buf);
 	if (buf_len < IP_HEADER_BYTE_COUNT)
@@ -164,7 +194,7 @@ int ip_ipv4_header_serdes(ip_ipv4_t *i, uint8_t *buf, size_t buf_len, int serial
 	return IP_HEADER_BYTE_COUNT;
 }
 
-int ip_arp_header_serdes(ip_arp_t *arp, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_arp_header_serdes(ip_arp_t *arp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(arp);
 	assert(buf);
 	if (buf_len < IP_ARP_HEADER_BYTE_COUNT)
@@ -181,7 +211,7 @@ int ip_arp_header_serdes(ip_arp_t *arp, uint8_t *buf, size_t buf_len, int serial
 	return IP_ARP_HEADER_BYTE_COUNT;
 }
 
-int ip_icmp_header_serdes(ip_icmp_t *icmp, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_icmp_header_serdes(ip_icmp_t *icmp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(icmp);
 	assert(buf);
 	if (buf_len < IP_ICMP_HEADER_BYTE_COUNT)
@@ -193,7 +223,7 @@ int ip_icmp_header_serdes(ip_icmp_t *icmp, uint8_t *buf, size_t buf_len, int ser
 	return IP_ICMP_HEADER_BYTE_COUNT;
 }
 
-int ip_udp_header_serdes(ip_udp_t *udp, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_udp_header_serdes(ip_udp_t *udp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(udp);
 	assert(buf);
 	if (buf_len < IP_UDP_HEADER_BYTE_COUNT)
@@ -205,7 +235,7 @@ int ip_udp_header_serdes(ip_udp_t *udp, uint8_t *buf, size_t buf_len, int serial
 	return IP_UDP_HEADER_BYTE_COUNT;
 }
 
-int ip_tcp_header_serdes(ip_tcp_t *tcp, uint8_t *buf, size_t buf_len, int serialize) {
+static int ip_tcp_header_serdes(ip_tcp_t *tcp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(tcp);
 	assert(buf);
 	if (buf_len < IP_TCP_HEADER_BYTE_COUNT)
@@ -223,6 +253,35 @@ int ip_tcp_header_serdes(ip_tcp_t *tcp, uint8_t *buf, size_t buf_len, int serial
 	return IP_TCP_HEADER_BYTE_COUNT;
 }
 
+static void ip_arp_clear(ip_arp_cache_entry_t *arp) {
+	assert(arp);
+	memset(arp, 0, sizeof (*arp));
+}
+
+static int ip_arp_find(ip_arp_cache_entry_t *arps, const size_t len, const uint32_t ipv4) {
+	assert(arps);
+	assert(len < INT_MAX);
+	for (size_t i = 0; i < len; i++) {
+		ip_arp_cache_entry_t *arp = &arps[i];
+		if (arp->ipv4 == ipv4) {
+			// TODO: Timeout / state
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int ip_arp_rfind(ip_arp_cache_entry_t *arps, const size_t len, uint8_t mac[6]) {
+	assert(arps);
+	for (size_t i = 0; i < len; i++) {
+		ip_arp_cache_entry_t *arp = &arps[i];
+		if (!memcpy(arp->mac, mac, 6)) {
+			// TODO: Timeout / state
+			return i;
+		}
+	}
+	return -1;
+}
 
 #if 0
 
@@ -349,6 +408,7 @@ static int ip_timer_reset_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
 /* https://docs.kernel.org/networking/tuntap.html */
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 
@@ -375,9 +435,42 @@ int tun_alloc(char *dev) {
 	strcpy(dev, ifr.ifr_name);
 	return fd;
 }
+
 #endif 
 
+#ifdef __linux__
+
+#include <unistd.h>
+
+int ip_os_sleep(void *os_sleep, long *ms) {
+	IP_UNUSED(os_sleep);
+	assert(ms);
+	const long long us = 1000ll * (*ms);
+	*ms = 0;
+	return usleep(us);
+}
+
+int ip_os_time(void *os_time, long *ms) {
+	IP_UNUSED(os_time);
+	assert(ms);
+	*ms = 0;
+	struct timespec t = { .tv_sec = 0, .tv_nsec = 0, };
+	if (clock_gettime(CLOCK_MONOTONIC, &t) < 0)
+		return -1;
+	unsigned long r = (t.tv_sec * 1000l) + (t.tv_nsec / 1000l);
+	*ms = r;
+	return 0;
+
+}
+#endif
+
+
 static int ip_stack_init(ip_stack_t *ip) {
+	assert(ip);
+	return 0;
+}
+
+static int ip_stack_deinit(ip_stack_t *ip) {
 	assert(ip);
 	return 0;
 }
@@ -387,16 +480,25 @@ static int ip_stack(ip_stack_t *ip) {
 	return 0;
 }
 
+static void ip_tests(void) {
+	if (!IP_DEBUG)
+		return;
+	// TODO: Assertion based unit tests
+}
+
 int main(void) {
-	static ip_stack_t stack = {
-		.log_level = IP_LOG_DEBUG,
-	}, *ip = &stack;
+	static ip_stack_t stack = { .fatal = 0, }, *ip = &stack;
+	ip->log_level = IP_LOG_DEBUG;
+	ip->os_sleep_ms = ip_os_sleep;
+	ip->os_time_ms = ip_os_time;
 	if (ip_stack_init(ip) < 0) {
 		ip_fatal(ip, "initialization failed");
 	}
+	ip_tests();
 	ip_info(ip, "initialization complete");
 
 	ip_stack(ip);
+	ip_stack_deinit(ip);
 	return 0;
 }
 #if 0
