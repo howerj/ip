@@ -19,10 +19,11 @@
 
 #define IP_UNUSED(X) ((void)(X))
 
+// TODO: Make a serdes for these structures, just for printing.
 typedef struct {
 	uint8_t mac[6];
 	uint32_t ipv4;
-	int state, ttl_ms;
+	int state /* unused, waiting, active, static */, ttl_ms;
 } ip_arp_cache_entry_t;
 
 typedef struct {
@@ -66,6 +67,7 @@ static inline uint16_t ip_ntohs(uint16_t x) { return ip_endianess() ? x : ip_u16
 static inline uint32_t ip_ntohl(uint16_t x) { return ip_endianess() ? x : ip_u32swap(x); }
 static inline uint16_t ip_htons(uint16_t x) { return ip_endianess() ? x : ip_u16swap(x); }
 static inline uint32_t ip_htonl(uint32_t x) { return ip_endianess() ? x : ip_u32swap(x); }
+static inline uint32_t ip_htonll(uint64_t x) { return ip_endianess() ? x : ip_u64swap(x); }
 
 static int ip_v4addr(const char *s, uint32_t *addr) {
 	assert(s);
@@ -84,6 +86,11 @@ static int ip_v4addr(const char *s, uint32_t *addr) {
 	return 0;
 }
 
+static int ip_v4addr_to_string(uint32_t addr, char *s, size_t len) {
+	assert(s);
+	int ip[4] = { (addr >> 24) & 255, (addr >> 16) & 255, (addr >> 8) & 255, (addr >> 0) & 255, };
+	return snprintf(s, len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[4]);
+}
 
 // TODO: Check / unit test these functions
 static inline void ip_htons_b(uint16_t x, uint8_t *buf) {
@@ -102,6 +109,19 @@ static inline void ip_htonl_b(uint32_t x, uint8_t *buf) {
 	buf[3] = x >> 24;
 }
 
+static inline void ip_htonll_b(uint64_t x, uint8_t *buf) {
+	assert(buf);
+	x = ip_htonll(x);
+	buf[0] = x >>  0;
+	buf[1] = x >>  8;
+	buf[2] = x >> 16;
+	buf[3] = x >> 24;
+	buf[4] = x >> 32;
+	buf[5] = x >> 40;
+	buf[6] = x >> 48;
+	buf[7] = x >> 56;
+}
+
 static inline uint16_t ip_ntohs_b(const uint8_t *buf) {
 	assert(buf);
 	const uint16_t x = 
@@ -118,6 +138,20 @@ static inline uint32_t ip_ntohl_b(const uint8_t *buf) {
 		(((uint32_t)buf[2]) << 16) |
 		(((uint32_t)buf[3]) << 24) ;
 	return ip_htonl(x);
+}
+
+static inline uint64_t ip_ntohll_b(const uint8_t *buf) {
+	assert(buf);
+	const uint64_t x = 
+		(((uint64_t)buf[0]) <<  0) |
+		(((uint64_t)buf[1]) <<  8) |
+		(((uint64_t)buf[2]) << 16) |
+		(((uint64_t)buf[3]) << 24) |
+		(((uint64_t)buf[4]) << 32) |
+		(((uint64_t)buf[5]) << 40) |
+		(((uint64_t)buf[6]) << 48) |
+		(((uint64_t)buf[7]) << 56) ;
+	return ip_htonll(x);
 }
 
 // TODO: Option to print if `serialize` is negative, need to pass in print
@@ -150,6 +184,16 @@ static inline void ip_u32_buf_serdes(uint32_t *x, uint8_t *buf, int serialize) {
 		return;
 	}
 	*x = ip_ntohl_b(buf);
+}
+
+static inline void ip_u64_buf_serdes(uint64_t *x, uint8_t *buf, int serialize) {
+	assert(x);
+	assert(buf);
+	if (serialize) {
+		ip_htonll_b(*x, buf);
+		return;
+	}
+	*x = ip_ntohll_b(buf);
 }
 
 static inline void ip_memory_serdes(uint8_t *structure, uint8_t *network, size_t length, int serialize) {
@@ -253,6 +297,26 @@ static int ip_tcp_header_serdes(ip_tcp_t *tcp, uint8_t *buf, size_t buf_len, int
 	return IP_TCP_HEADER_BYTE_COUNT;
 }
 
+static int ip_ntp_header_serdes(ip_ntp_t *ntp, uint8_t *buf, size_t buf_len, int serialize) {
+	assert(ntp);
+	assert(buf);
+	if (buf_len < IP_NTP_HEADER_BYTE_COUNT)
+		return -1;
+	ip_u8_buf_serdes(&ntp->livnm,        buf +  0, serialize);
+	ip_u8_buf_serdes(&ntp->stratum,      buf +  1, serialize);
+	ip_u8_buf_serdes(&ntp->poll,         buf +  2, serialize);
+	ip_u8_buf_serdes(&ntp->precision,    buf +  3, serialize);
+	ip_u32_buf_serdes(&ntp->root_delay,  buf +  4, serialize);
+	ip_u32_buf_serdes(&ntp->root_dispersion,  buf +  8, serialize);
+	ip_u32_buf_serdes(&ntp->refid,       buf + 12, serialize);
+	ip_u64_buf_serdes(&ntp->ref_ts,      buf + 16, serialize);
+	ip_u64_buf_serdes(&ntp->orig_ts,     buf + 24, serialize);
+	ip_u64_buf_serdes(&ntp->rx_ts,       buf + 32, serialize);
+	ip_u64_buf_serdes(&ntp->tx_ts,       buf + 40, serialize);
+	/* There are more optional fields, of varying length, such as key ids, message digests, auth, etcetera. */
+	return IP_NTP_HEADER_BYTE_COUNT;
+}
+
 static void ip_arp_clear(ip_arp_cache_entry_t *arp) {
 	assert(arp);
 	memset(arp, 0, sizeof (*arp));
@@ -282,26 +346,6 @@ static int ip_arp_rfind(ip_arp_cache_entry_t *arps, const size_t len, uint8_t ma
 	}
 	return -1;
 }
-
-#if 0
-
-#define TCP_HEADER_BYTE_COUNT (20)
-
-typedef struct {
-	uint8_t livnm;       /* 2-bit Leap, 3-bit version, 3-bit mode */
-	uint8_t stratum;     /* Stratum [closeness to good clock] */
-	uint8_t poll;        /* Poll field, max suggested poll rate */
-	uint8_t precision;   /* Precision [signed log2 seconds] */
-	uint32_t root_delay; /* Root delay */
-	uint32_t root_dispersion; /* Root dispersion */
-	uint32_t refid;      /* Reference ID */
-	uint64_t ref_ts;     /* Reference Time Stamp */
-	uint64_t orig_ts;    /* Origin Time Stamp */
-	uint64_t rx_ts;      /* RX Time Stamp */
-	uint64_t tx_ts;      /* 8-byte Transmit time stamp */
-	/* There are more optional fields, of varying length, such as key ids, message digests, auth, etcetera. */
-} ntp_t;
-#endif
 
 static int ip_log(ip_stack_t *ip, int fatal, unsigned level, const char *func, unsigned line, const char *fmt, ...) {
 	assert(fmt);
