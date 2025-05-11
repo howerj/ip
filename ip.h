@@ -14,6 +14,13 @@
 #define IP_PACKED __attribute__((packed))
 #endif
 
+enum { /* There are many more see <https://en.wikipedia.org/wiki/EtherType> */
+	IP_ETHERNET_TYPE_IPV4 = 0x0800u,
+	IP_ETHERNET_TYPE_ARP  = 0x0806u,
+	IP_ETHERNET_TYPE_RARP = 0x8035u,
+	IP_ETHERNET_TYPE_IPV6 = 0x86DDu,
+};
+
 typedef struct {
 	uint8_t source[6];
 	uint8_t destination[6];
