@@ -1,6 +1,9 @@
-*.exe
 *.a
-*.so
-*.o
+*.bin
 *.dll
+*.exe
+*.hex
+*.o
+*.so
+*.txt
 ip

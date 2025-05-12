@@ -81,9 +81,9 @@ typedef struct {
 	uint16_t destination; /* 16 bit destination port */
 	uint32_t seq;         /* 32 bit sequence number */
 	uint32_t ack;         /* 32 bit acknowledgement */
-	uint8_t offset;       /*  8 bit offset */
+	uint8_t  offset;      /*  8 bit offset */
 	uint16_t flags;       /* 16 bit flags */
-	uint8_t window;       /*  8 bit window size */
+	uint8_t  window;      /*  8 bit window size */
 	uint16_t checksum;    /* 16 bit checksum */
 	uint16_t urgent;      /* 16 bit urgent pointer */
 } ip_tcp_t;

@@ -29,6 +29,8 @@ To Do / Plan:
   packet, on UDP packet, etcetera).
 * [ ] Make a test bench, and way of creating corrupt packets for both
   RX and TX for testing purposes.
+* [ ] Documentation; turn into a (semi-) literate program, like
+  <https://github.com/howerj/libforth>.
 * [ ] Make utilities such as ping, netcat, as part of a multicall binary.
 * [ ] Turn into library; need a way to schedule the stack, sleep,
   and receive / transmit packets over Ethernet.
@@ -39,6 +41,7 @@ To Do / Plan:
 * [ ] port to <https://github.com/howerj/subleq-network>.
 * [ ] port to an OS of my own design?
 * [ ] Turn into header only library?
+* [ ] Handle WiFi frames as well as Ethernet ones
 * [ ] Make a VHDL version?
 * [ ] Make a version in rust?
 * [ ] Add back in warnings for unused functions

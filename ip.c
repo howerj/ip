@@ -5,8 +5,10 @@
  * A customizable IP stack. */
 #include "ip.h"
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,13 +57,20 @@ enum { IP_IFACE_METHOD_PCAP, IP_IFACE_METHOD_LINUX_TUN, IP_IFACE_METHOD_CUSTOM, 
 
 #define IP_V4_BROADCAST_ADDRESS (0xFFFFFFFFul)
 
+#define IP_NELEMS(X) (sizeof((X)) / sizeof((X)[0]))
 #define IP_UNUSED(X) ((void)(X))
 
 enum { IP_ARP_CACHE_ENTRY_UNUSED, IP_ARP_CACHE_ENTRY_WAITING, IP_ARP_CACHE_ENTRY_ACTIVE, IP_ARP_CACHE_ENTRY_STATIC, };
 
-// TODO: Make a serdes for these structures, just for printing.
 typedef struct {
-	uint32_t ttl_ms;
+	unsigned long start_ms, timeout_ms;
+	int state; /* -1 = error, 0 = uninitialized, 1 = initialized, 2 = expired */
+} ip_timer_t;
+
+enum { IP_ARP_CACHE_UNUSED, IP_ARP_CACHE_WAITING, IP_ARP_CACHE_ACTIVE, IP_ARP_CACHE_STATIC, };
+
+typedef struct {
+	ip_timer_t timer;
 	uint32_t ipv4;
 	uint8_t mac[6];
 	uint8_t state /* unused, waiting, active, static */;
@@ -72,8 +81,8 @@ typedef struct {
 typedef struct {
 	int (*os_time_ms)(void *os_time, long *time_ms);
 	int (*os_sleep_ms)(void *os_sleep, long *sleep_ms);
-	int (*ethernet_rx)(void *ethernet, uint8_t *buf, size_t buflen);
-	int (*ethernet_tx)(void *ethernet, uint8_t *buf, size_t buflen);
+	long (*ethernet_rx)(void *ethernet, uint8_t *buf, size_t buflen);
+	long (*ethernet_tx)(void *ethernet, uint8_t *buf, size_t buflen);
 	void *os_time,  /* OS timer object, most likely NULL */
 	     *os_sleep, /* OS sleep object, most likely NULL */
 	     *ethernet, /* Ethernet interface handle */
@@ -89,6 +98,7 @@ typedef struct {
 	unsigned long arp_cache_timeout_ms;
 
 	int fatal; /* fatal error occurred, we should exit gracefully */
+	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
 	unsigned log_level; /* level to log at */
 } ip_stack_t;
 
@@ -119,6 +129,34 @@ static int ip_log(ip_stack_t *ip, int fatal, unsigned level, const char *func, u
 		exit(1);
 	}
 	return 0;
+}
+
+static int ip_sleep(ip_stack_t *ip, long *sleep_ms) {
+	assert(ip);
+	assert(ip->os_sleep_ms);
+	assert(sleep_ms);
+	return ip->os_sleep_ms(ip->os_sleep, sleep_ms);
+}
+
+static int ip_time_ms(ip_stack_t *ip, long *time_ms) {
+	assert(ip);
+	assert(ip->os_time_ms);
+	assert(time_ms);
+	return ip->os_time_ms(ip->os_time, time_ms);
+}
+
+static int ip_ethernet_rx(ip_stack_t *ip, uint8_t *buf, size_t buflen) {
+	assert(ip);
+	assert(buf);
+	assert(ip->ethernet_rx);
+	return ip->ethernet_rx(ip->ethernet, buf, buflen);
+}
+
+static int ip_ethernet_tx(ip_stack_t *ip, uint8_t *buf, size_t buflen) {
+	assert(ip);
+	assert(buf);
+	assert(ip->ethernet_tx);
+	return ip->ethernet_tx(ip->ethernet, buf, buflen);
 }
 
 #define ip_fatal(IP, ...) ip_log((IP), 1, IP_LOG_FATAL, __func__, __LINE__, __VA_ARGS__)
@@ -322,6 +360,48 @@ static inline void ip_memory_serdes(uint8_t *structure, uint8_t *network, size_t
 	memcpy(structure, network, length);
 }
 
+enum { IP_TIMER_ERROR = -1, IP_TIMER_UNINIT = 0, IP_TIMER_INIT = 1, IP_TIMER_EXPIRED = 2, };
+
+static int ip_timer_start_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
+	assert(ip);
+	assert(t);
+	long now = 0;
+	memset(t, 0, sizeof (*t));
+	t->state = IP_TIMER_UNINIT;
+	if (ip_time_ms(ip, &now) < 0) {
+		t->state = IP_TIMER_ERROR;
+		return -1;
+	}
+	t->start_ms = (unsigned long)now;
+	t->timeout_ms = ms;
+	t->state = IP_TIMER_INIT;
+	return 0;
+}
+
+static int ip_timer_expired(ip_stack_t *ip, ip_timer_t *t) {
+	assert(ip);
+	assert(t);
+	assert(t->state > IP_TIMER_UNINIT); /* not in error or uninitialized state */
+	if (t->state == IP_TIMER_EXPIRED)
+		return 1;
+	long now = 0;
+	if (ip_time_ms(ip, &now) < 0)
+		return -1;
+	unsigned long diff = ((unsigned long)now) - t->start_ms;
+	if (diff > t->timeout_ms) {
+		t->state = IP_TIMER_EXPIRED;
+		return 1;
+	}
+	return 0;
+}
+
+static int ip_timer_reset_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
+	assert(ip);
+	assert(t);
+	return ip_timer_start_ms(ip, t, ms);
+}
+
+// TODO: Handle WiFi frames as well
 static int ip_ethernet_header_serdes(ip_ethernet_t *e, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(e);
 	assert(buf);
@@ -433,7 +513,6 @@ static int ip_ntp_header_serdes(ip_ntp_t *ntp, uint8_t *buf, size_t buf_len, int
 	return IP_NTP_HEADER_BYTE_COUNT;
 }
 
-// TODO: Global ARP entry TTL option and CONFIG_ option
 static int ip_arp_cache_entry_serdes(ip_arp_cache_entry_t *arp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(arp);
 	assert(buf);
@@ -441,7 +520,8 @@ static int ip_arp_cache_entry_serdes(ip_arp_cache_entry_t *arp, uint8_t *buf, si
 	if (buf_len < IP_ARP_CACHE_ENTRY_BYTE_COUNT)
 		return -1;
 
-	ip_u32_buf_serdes(&arp->ttl_ms, buf +  0, serialize);
+	// TODO: Serialize timer?
+	/*ip_u32_buf_serdes(&arp->ttl_ms, buf +  0, serialize);*/
 	ip_u32_buf_serdes(&arp->ipv4,   buf +  4, serialize);
 	ip_memory_serdes(arp->mac,      buf +  8, 6, serialize);
 	ip_u8_buf_serdes(&arp->state,   buf + 14, serialize);
@@ -460,10 +540,10 @@ static int ip_udp_tx(ip_stack_t *ip, ip_udp_t *udp, uint8_t *buf, size_t buf_len
 	return -1;
 }
 
-static int ip_arp_timed_out(ip_arp_cache_entry_t *arp) {
+static int ip_arp_timed_out(ip_stack_t *ip, ip_arp_cache_entry_t *arp) {
+	assert(ip);
 	assert(arp);
-	// TODO: Implement
-	return 0;
+	return ip_timer_expired(ip, &arp->timer);
 }
 
 static inline void ip_arp_clear(ip_arp_cache_entry_t *arp) {
@@ -473,13 +553,14 @@ static inline void ip_arp_clear(ip_arp_cache_entry_t *arp) {
 
 /* N.B. For larger ARP tables a binary tree would probably be a better way of
  * storing the entries, but for small ARP table sizes, why bother? */
-static int ip_arp_find(ip_arp_cache_entry_t *arps, const size_t len, const uint32_t ipv4) {
+static int ip_arp_find(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len, const uint32_t ipv4) {
+	assert(ip);
 	assert(arps);
 	assert(len < INT_MAX);
 	for (size_t i = 0; i < len; i++) {
 		ip_arp_cache_entry_t *arp = &arps[i];
 		if (arp->ipv4 == ipv4) {
-			if (ip_arp_timed_out(arp)) {
+			if (ip_arp_timed_out(ip, arp)) {
 				ip_arp_clear(arp);
 				continue;
 			}
@@ -489,13 +570,13 @@ static int ip_arp_find(ip_arp_cache_entry_t *arps, const size_t len, const uint3
 	return -1;
 }
 
-static int ip_arp_rfind(ip_arp_cache_entry_t *arps, const size_t len, uint8_t mac[6]) {
+static int ip_arp_rfind(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len, uint8_t mac[6]) {
+	assert(ip);
 	assert(arps);
 	for (size_t i = 0; i < len; i++) {
 		ip_arp_cache_entry_t *arp = &arps[i];
 		if (!memcpy(arp->mac, mac, 6)) {
-			// TODO: Timeout / state
-			if (ip_arp_timed_out(arp)) {
+			if (ip_arp_timed_out(ip, arp)) {
 				ip_arp_clear(arp);
 				continue;
 			}
@@ -505,79 +586,6 @@ static int ip_arp_rfind(ip_arp_cache_entry_t *arps, const size_t len, uint8_t ma
 	return -1;
 }
 
-static int ip_sleep(ip_stack_t *ip, long *sleep_ms) {
-	assert(ip);
-	assert(ip->os_sleep_ms);
-	assert(sleep_ms);
-	return ip->os_sleep_ms(ip->os_sleep, sleep_ms);
-}
-
-static int ip_time_ms(ip_stack_t *ip, long *time_ms) {
-	assert(ip);
-	assert(ip->os_time_ms);
-	assert(time_ms);
-	return ip->os_time_ms(ip->os_time, time_ms);
-}
-
-static int ip_ethernet_rx(ip_stack_t *ip, uint8_t *buf, size_t buflen) {
-	assert(ip);
-	assert(buf);
-	assert(ip->ethernet_rx);
-	return ip->ethernet_rx(ip->ethernet, buf, buflen);
-}
-
-static int ip_ethernet_tx(ip_stack_t *ip, uint8_t *buf, size_t buflen) {
-	assert(ip);
-	assert(buf);
-	assert(ip->ethernet_tx);
-	return ip->ethernet_tx(ip->ethernet, buf, buflen);
-}
-
-enum { IP_TIMER_ERROR = -1, IP_TIMER_UNINIT = 0, IP_TIMER_INIT = 1, IP_TIMER_EXPIRED = 2, };
-
-typedef struct {
-	unsigned long start_ms, timeout_ms;
-	int state; /* -1 = error, 0 = uninitialized, 1 = initialized, 2 = expired */
-} ip_timer_t;
-
-static int ip_timer_start_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
-	assert(ip);
-	assert(t);
-	long now = 0;
-	memset(t, 0, sizeof (*t));
-	t->state = IP_TIMER_UNINIT;
-	if (ip_time_ms(ip, &now) < 0) {
-		t->state = IP_TIMER_ERROR;
-		return -1;
-	}
-	t->start_ms = (unsigned long)now;
-	t->timeout_ms = ms;
-	t->state = IP_TIMER_INIT;
-	return 0;
-}
-
-static int ip_timer_expired(ip_stack_t *ip, ip_timer_t *t) {
-	assert(ip);
-	assert(t);
-	assert(t->state > IP_TIMER_UNINIT); /* not in error or uninitialized state */
-	if (t->state == IP_TIMER_EXPIRED)
-		return 1;
-	long now = 0;
-	if (ip_time_ms(ip, &now) < 0)
-		return -1;
-	unsigned long diff = ((unsigned long)now) - t->start_ms;
-	if (diff > t->timeout_ms) {
-		t->state = IP_TIMER_EXPIRED;
-		return 1;
-	}
-	return 0;
-}
-
-static int ip_timer_reset_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
-	assert(ip);
-	assert(t);
-	return ip_timer_start_ms(ip, t, ms);
-}
 
 #if 0
 /* OS Dependent functions */
@@ -644,7 +652,6 @@ static int ip_os_time(void *os_time, long *ms) {
 
 #if CONFIG_IP_IFACE_METHOD == IP_IFACE_METHOD_PCAP
 
-static const char *ip_pcap_device_name = "wlp2s0"; // TODO: specify by command line
 
 #include <pcap.h>
 static int ip_pcapdev_init(ip_stack_t *ip, const char *name, pcap_t **handle) {
@@ -714,14 +721,14 @@ static inline int ip_dump(FILE *out, const char *banner, const unsigned char *m,
 	return 0;
 }
 
-static int ip_pcap_ethernet_poll(pcap_t *handle, unsigned char *memory, int max) {
+static long ip_pcap_ethernet_poll(pcap_t *handle, unsigned char *memory, int max) {
 	assert(handle);
 	assert(memory);
 	const u_char *packet = NULL;
 	struct pcap_pkthdr *header = NULL;
-	if (pcap_next_ex(handle, &header, &packet) == 0) {
-		return -1;
-	}
+	long r = pcap_next_ex(handle, &header, &packet);
+	if (r <= 0)
+		return r;
 	int len = header->len;
 	len = len > max ? max : len;
 	memcpy(memory, packet, len);
@@ -735,22 +742,23 @@ static int ip_pcap_ethernet_tx(pcap_t *handle, unsigned char *memory, int len) {
 	return pcap_sendpacket(handle, memory, len);
 }
 
-static int ip_ethernet_rx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
+static long ip_ethernet_rx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
 	assert(ethernet);
 	assert(buf);
-	return ip_pcap_ethernet_poll(ethernet, buf, buflen);
+	const long r = ip_pcap_ethernet_poll(ethernet, buf, buflen);
+	if (r < 0)
+		return -1; /* all PCAP errors are negative */
+	return r;
 }
 
-static int ip_ethernet_tx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
+static long ip_ethernet_tx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
 	assert(ethernet);
 	assert(buf);
 	return ip_pcap_ethernet_tx(ethernet, buf, buflen);
 }
 
-static int ip_stack_init(ip_stack_t *ip) {
+static int ip_stack_init(ip_stack_t *ip, const char *dev) {
 	assert(ip);
-
-	const char *dev = ip_pcap_device_name;
 	assert(dev);
 	pcap_t *handle = NULL;
 	if (ip_pcapdev_init(ip, dev, &handle) < 0) {
@@ -769,30 +777,343 @@ static int ip_stack_deinit(ip_stack_t *ip) {
 	ip->ethernet = NULL;
 	return 0;
 }
+#else
+#error "No valid network C API available"
+#endif
 
-#if 0
+static int ip_stack(ip_stack_t *ip) {
+	assert(ip);
+	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
+	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
+	while (!ip->stop) {
+		const int r = ip_ethernet_rx(ip, ip->rx, ip->rx_len);
+		if (r < 0) {
+			ip_error(ip, "packet rx error");
+			continue;
+		} else if (r == 0) {
+			long sleep_ms = 10;
+			(void)ip_sleep(ip, &sleep_ms);
+			continue;
+		} else { /* got packet, r == packet length */
+			assert(r <= (long)ip->rx_len);
+			ip_debug(ip, "packet rx len %d", r);
+			ip_ethernet_t e = { .type = 0, };
+			const int s = ip_ethernet_header_serdes(&e, ip->rx, r, 0);
+			if (s < 0) {
+				ip_error(ip, "ethernet header serdes fail");
+				continue;
+			}
+			switch (e.type) {
+			case IP_ETHERNET_TYPE_IPV4:
+				break;
+			case IP_ETHERNET_TYPE_ARP:
+				break;
+			case IP_ETHERNET_TYPE_RARP:
+				break;
+			case IP_ETHERNET_TYPE_IPV6:
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	return 0;
+}
+
+static int ip_tests(void) {
+	if (!IP_DEBUG)
+		return 0;
+	// TODO: Assertion based unit tests
+	return 0;
+}
+
+typedef struct {
+	char *arg;   /* parsed argument */
+	long narg;   /* converted argument for '#' */
+	int index,   /* index into argument list */
+	    option,  /* parsed option */
+	    reset;   /* set to reset */
+	FILE *error, /* error stream to print to (set to NULL to turn off */
+	     *help;  /* if set, print out all options and return */
+	char *place; /* internal use: scanner position */
+	int  init;   /* internal use: initialized or not */
+} ip_getopt_t;     /* getopt clone; with a few modifications */
+
+enum { /* used with `ip_options_t` structure */
+	IP_OPTIONS_INVALID_E, /* default to invalid if option type not set */
+	IP_OPTIONS_BOOL_E,    /* select boolean `b` value in union `v` */
+	IP_OPTIONS_LONG_E,    /* select numeric long `n` value in union `v` */
+	IP_OPTIONS_STRING_E,  /* select string `s` value in union `v` */
+};
+
+typedef struct { /* Used for parsing key=value strings (strings must be modifiable and persistent) */
+	char *opt,  /* key; name of option */
+	     *help; /* help string for option */
+	union { /* pointers to values to set */
+		bool *b; 
+		long *n; 
+		char **s; 
+	} v; /* union of possible values, selected on `type` */
+	int type; /* type of value, in following union, e.g. IP_OPTIONS_LONG_E. */
+} ip_options_t; /* N.B. This could be used for saving configurations as well as setting them */
+
+static int ip_flag(const char *v) {
+	assert(v);
+
+	static char *y[] = { "yes", "on", "true", };
+	static char *n[] = { "no",  "off", "false", };
+
+	for (size_t i = 0; i < IP_NELEMS(y); i++) {
+		if (!strcmp(y[i], v))
+			return 1;
+		if (!strcmp(n[i], v))
+			return 0;
+	}
+	return -1;
+}
+
+static int ip_convert(const char *n, int base, long *out) {
+	assert(n);
+	assert(out);
+	*out = 0;
+	char *endptr = NULL;
+	errno = 0;
+	const long r = strtol(n, &endptr, base);
+	if (*endptr)
+		return -1;
+	if (errno == ERANGE)
+		return -1;
+	*out = r;
+	return 0;
+}
+
+static int ip_options_help(ip_options_t *os, size_t olen, FILE *out) {
+	assert(os);
+	assert(out);
+	for (size_t i = 0; i < olen; i++) {
+		ip_options_t *o = &os[i];
+		assert(o->opt);
+		const char *type = "unknown";
+		switch (o->type) {
+		case IP_OPTIONS_BOOL_E: type = "bool"; break;
+		case IP_OPTIONS_LONG_E: type = "long"; break;
+		case IP_OPTIONS_STRING_E: type = "string"; break;
+		case IP_OPTIONS_INVALID_E: /* fall-through */
+		default: type = "invalid"; break;
+		}
+		if (fprintf(out, " * `%s`=%s: %s\n", o->opt, type, o->help ? o->help : "") < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static int ip_options_set(ip_options_t *os, size_t olen, char *kv, FILE *error) {
+	assert(os);
+	char *k = kv, *v = NULL;
+	if ((v = strchr(kv, '=')) == NULL || *v == '\0') {
+		if (error)
+			(void)fprintf(error, "invalid key-value format: %s\n", kv);
+		return -1;
+	}
+	*v++ = '\0'; /* Assumes `kv` is writeable! */
+
+	ip_options_t *o = NULL;
+	for (size_t i = 0; i < olen; i++) {
+		ip_options_t *p = &os[i];
+		if (!strcmp(p->opt, k)) { o = p; break; }
+	}
+	if (!o) {
+		if (error)
+			(void)fprintf(error, "option `%s` not found\n", k);
+		return -1;
+	}
+
+	switch (o->type) {
+	case IP_OPTIONS_BOOL_E: {
+		const int r = ip_flag(v);
+		assert(r == 0 || r == 1 || r == -1);
+		if (r < 0) {
+			if (error)
+				(void)fprintf(error, "invalid flag in option `%s`: `%s`\n", k, v);
+			return -1;
+		}
+		*o->v.b = !!r;
+		break;
+	}
+	case IP_OPTIONS_LONG_E: { 
+		const int r = ip_convert(v, 0, o->v.n); 
+		if (r < 0) {
+			if (error)
+				(void)fprintf(error, "invalid number in option `%s`: `%s`\n", k, v);
+			return -1;
+		}
+		break; 
+	}
+	case IP_OPTIONS_STRING_E: { *o->v.s = v; /* Assumes `kv` is persistent! */ break; }
+	default: return -1;
+	}
+	
+	return 0;
+}
+
+/* Adapted from: <https://stackoverflow.com/questions/10404448>, this
+ * could be extended to accept an array of options instead, or
+ * perhaps it could be turned into a variadic functions,
+ * that is not needed here. The function and structure should be turned
+ * into a header only library. 
+ *
+ * This version handles parsing numbers with '#' and strings with ':'.
+ *
+ * Return value:
+ *
+ * - "-1": Finished parsing (end of options or "--" option encountered).
+ * - ":": Missing argument (either number or string).
+ * - "?": Bad option.
+ * - "!": Bad I/O (e.g. `printf` failed).
+ * - "#": Bad numeric argument (out of range, not a number, ...)
+ *
+ * Any other value should correspond to an option. */
+static int ip_getopt(ip_getopt_t *opt, const int argc, char *const argv[], const char *fmt) {
+	assert(opt);
+	assert(fmt);
+	assert(argv);
+	enum { BADARG_E = ':', BADCH_E = '?', BADIO_E = '!', BADNUM_E = '#', OPTEND_E = -1, };
+
+#define IP_GETOPT_NEEDS_ARG(X) ((X) == ':' || (X) == '#')
+
+	if (opt->help) {
+		for (int ch = 0; (ch = *fmt++);) {
+			if (fprintf(opt->help, "\t-%c ", ch) < 0)
+				return BADIO_E; 
+			if (IP_GETOPT_NEEDS_ARG(*fmt)) {
+				if (fprintf(opt->help, "%s", *fmt == ':' ? "<string>" : "<number>") < 0)
+					return BADIO_E;
+				fmt++;
+			}
+			if (fputs("\n", opt->help) < 0)
+				return BADIO_E;
+		}
+		return OPTEND_E;
+	}
+
+	if (!(opt->init)) {
+		opt->place = ""; /* option letter processing */
+		opt->init  = 1;
+		opt->index = 1;
+	}
+
+	if (opt->reset || !*opt->place) { /* update scanning pointer */
+		opt->reset = 0;
+		if (opt->index >= argc || *(opt->place = argv[opt->index]) != '-') {
+			opt->place = "";
+			return OPTEND_E;
+		}
+		if (opt->place[1] && *++opt->place == '-') { /* found "--" */
+			opt->index++;
+			opt->place = "";
+			return OPTEND_E;
+		}
+	}
+
+	const char *oli = NULL; /* option letter list index */
+	opt->option = *opt->place++;
+	if (IP_GETOPT_NEEDS_ARG(opt->option) || !(oli = strchr(fmt, opt->option))) { /* option letter okay? */
+		 /* if the user didn't specify '-' as an option, assume it means -1.  */
+		if (opt->option == '-')
+			return OPTEND_E;
+		if (!*opt->place)
+			opt->index++;
+		if (opt->error && !IP_GETOPT_NEEDS_ARG(*fmt))
+			if (fprintf(opt->error, "illegal option -- %c\n", opt->option) < 0)
+				return BADIO_E;
+		return BADCH_E;
+	}
+
+	const int o = *++oli;
+	if (!IP_GETOPT_NEEDS_ARG(o)) {
+		opt->arg = NULL;
+		if (!*opt->place)
+			opt->index++;
+	} else {  /* need an argument */
+		if (*opt->place) { /* no white space */
+			opt->arg = opt->place;
+			if (o == '#') {
+				if (ip_convert(opt->arg, 0, &opt->narg) < 0) {
+					if (opt->error)
+						if (fprintf(opt->error, "option requires numeric value -- %s\n", opt->arg) < 0)
+							return BADIO_E;
+					return BADNUM_E;
+				}
+			}
+		} else if (argc <= ++opt->index) { /* no arg */
+			opt->place = "";
+			if (IP_GETOPT_NEEDS_ARG(*fmt)) {
+				return BADARG_E;
+			}
+			if (opt->error)
+				if (fprintf(opt->error, "option requires an argument -- %c\n", opt->option) < 0)
+					return BADIO_E;
+			return BADCH_E;
+		} else	{ /* white space */
+			opt->arg = argv[opt->index];
+			if (o == '#') {
+				if (ip_convert(opt->arg, 0, &opt->narg) < 0) {
+					if (opt->error)
+						if (fprintf(opt->error, "option requires numeric value -- %s\n", opt->arg) < 0)
+							return BADIO_E;
+					return BADNUM_E;
+				}
+			}
+		}
+		opt->place = "";
+		opt->index++;
+	}
+#undef IP_GETOPT_NEEDS_ARG
+	return opt->option; /* dump back option letter */
+}
+
+static int ip_help(FILE *out, const char *arg0, ip_options_t *kv, size_t kvlen) {
+	assert(out);
+	assert(arg0);
+	assert(kv);
+	const int r1 = fprintf(out, 
+		"Usage:   %s -h\n"
+		"Project: " IP_PROJECT "\n"
+		"Author:  " IP_AUTHOR "\n"
+		"E-mail:  " IP_EMAIL "\n"
+		"Repo:    " IP_REPO "\n"
+		"License: " IP_LICENSE "\n" 
+		"\n"
+		"This program is a demonstration for a networking stack. It is a word in progress.\n"
+		"This program return zero on success and non-zero on failure.\n" 
+		"\n", arg0);
+	const int r2 = ip_options_help(kv, kvlen, out);
+	const int r3 = fputc('\n', out);
+	return r1 < 0 || r2 < 0 || r3 < 0 ? -1 : 0;
+}
+
 #if defined(unix) || defined(__unix__) || defined(__unix) || (defined(__APPLE__) && defined(__MACH__))
 #include <unistd.h>
 #include <termios.h>
 
-static struct termios oldattr;
+static struct termios ip_oldattr;
 
-static void getch_deinit(void) {
-	(void)tcsetattr(STDIN_FILENO, TCSANOW, &oldattr);
+static void ip_getch_deinit(void) {
+	(void)tcsetattr(STDIN_FILENO, TCSANOW, &ip_oldattr);
 }
 
-static int getch(void) { /* Unix junk! */
+static int ip_getch(void) { /* Unix junk! */
 	static int terminit = 0;
 	if (!terminit) {
 		terminit = 1;
-		if (tcgetattr(STDIN_FILENO, &oldattr) < 0) goto fail;
-		struct termios newattr = oldattr;
+		if (tcgetattr(STDIN_FILENO, &ip_oldattr) < 0) goto fail;
+		struct termios newattr = ip_oldattr;
 		newattr.c_iflag &= ~(ICRNL);
 		newattr.c_lflag &= ~(ICANON | ECHO);
 		newattr.c_cc[VMIN]  = 0;
 		newattr.c_cc[VTIME] = 0;
 		if (tcsetattr(STDIN_FILENO, TCSANOW, &newattr) < 0) goto fail;
-		atexit(getch_deinit);
+		atexit(ip_getch_deinit);
 	}
 	unsigned char b = 0;
 	const int ch = read(STDIN_FILENO, &b, 1) != 1 ? -1 : b;
@@ -804,65 +1125,64 @@ fail:
 	return 0;
 }
 
-static int putch(int c) {
+static int ip_putch(int c) {
 	int r = putchar(c);
 	if (fflush(stdout) < 0) return -1;
 	return r;
 }
-#endif
-#endif
+#else
+#error "Unsupported operating system"
 #endif
 
-static int ip_stack(ip_stack_t *ip) {
-	assert(ip);
-	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
-	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
-	return 0;
-}
-
-static void ip_tests(void) {
-	if (!IP_DEBUG)
-		return;
-	// TODO: Assertion based unit tests
-}
-
-int main(void) {
+// TODO: Command line interface (integrate <https://github.com/howerj/pickle>?
+// Or just make something quick and dirty?).
+int main(int argc, char **argv) {
 	static uint8_t rx[65536], tx[65536];
+	char *interface = "lo";
+
 	static ip_stack_t stack = { 
-		.log_level = IP_LOG_DEBUG,
-		.os_sleep_ms = ip_os_sleep,
-		.os_time_ms = ip_os_time,
-		.ethernet_rx = ip_ethernet_rx_cb,
-		.ethernet_tx = ip_ethernet_tx_cb,
-		.ipv4_interface = CONFIG_IP_V4_DEFAULT,
-		.ipv4_default_gateway = CONFIG_IP_V4_DEFAULT_GATEWAY,
-
-		.rx = rx,
-		.tx = tx,
-		.rx_len = sizeof (rx),
-		.tx_len = sizeof (tx),
-
-		.arp_cache_timeout_ms = CONFIG_IP_ARP_CACHE_TIMEOUT_MS,
-
+		.log_level             =  IP_LOG_DEBUG,                    
+		.os_sleep_ms           =  ip_os_sleep,                     
+		.os_time_ms            =  ip_os_time,                      
+		.ethernet_rx           =  ip_ethernet_rx_cb,               
+		.ethernet_tx           =  ip_ethernet_tx_cb,               
+		.ipv4_interface        =  CONFIG_IP_V4_DEFAULT,            
+		.ipv4_default_gateway  =  CONFIG_IP_V4_DEFAULT_GATEWAY,    
+		.rx                    =  rx,                              
+		.tx                    =  tx,                              
+		.rx_len                =  sizeof(rx),
+		.tx_len                =  sizeof(tx),
+		.arp_cache_timeout_ms  =  CONFIG_IP_ARP_CACHE_TIMEOUT_MS,  
 	}, *ip = &stack;
-	if (ip_stack_init(ip) < 0) {
+
+	ip_options_t kv[] = {
+		{ .opt = "interface",    .v.s = &interface, .type = IP_OPTIONS_STRING_E, .help = "Set interface name", },
+	};
+
+	ip_getopt_t opts = { .error = stderr, };
+	for (int ch = 0; (ch = ip_getopt(&opts, argc, argv, "hto:")) != -1;) {
+		switch (ch) {
+		case 'h': return ip_help(stderr, argv[0], &kv[0], IP_NELEMS(kv)) < 0;
+		case 't': return ip_tests() < 0; break;
+		case 'o': if (ip_options_set(&kv[0], IP_NELEMS(kv), opts.arg, stderr) < 0) return 1; break;
+		default: return 1;
+		}
+	}
+
+	if (ip_stack_init(ip, interface) < 0) {
 		ip_fatal(ip, "initialization failed");
 		return 1;
 	}
-	ip_tests();
 	ip_info(ip, "initialization complete");
 
-	/*ip_timer_t t = { .state = 0, };
-	ip_timer_start_ms(ip, &t, 10000);
-	int r = 0;
-	ip_stack(ip);
-	for (r = 0;!(r = ip_timer_expired(ip, &t)); ) {
-		long s = 100;
-		ip_os_sleep(ip, &s);
+	if (ip_stack(ip) < 0) {
+		ip_error(ip, "error running ip stack");
 	}
-	ip_printf("r = %d\n", r);*/
 
-	ip_stack_deinit(ip);
+	if (ip_stack_deinit(ip) < 0) {
+		ip_fatal(ip, "deinitialization failed");
+	}
+	ip_info(ip, "deinitialization complete");
 	return 0;
 }
 
