@@ -14,7 +14,7 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef CONFIG_IP_ARP_CACHE_TIMEOUT_MS
+#ifndef CONFIG_IP_ARP_CACHE_TIMEOUT_MS /* Time out for an ARP cache entry, obviously */
 #define CONFIG_IP_ARP_CACHE_TIMEOUT_MS (60l * 1000l)
 #endif
 
@@ -38,6 +38,9 @@
 #define CONFIG_IP_MAC_ADDR_DEFAULT { 0x60, 0x08, 0xAD, 0x7D, 0x47, 0xE2, }
 #endif
 
+#ifndef CONFIG_IP_TTL_DEFAULT /* Default IPv4 TTL */
+#define CONFIG_IP_TTL_DEFAULT (0x80u)
+#endif
 
 enum { IP_IFACE_METHOD_PCAP, IP_IFACE_METHOD_LINUX_TUN, IP_IFACE_METHOD_CUSTOM, };
 
@@ -56,9 +59,18 @@ enum { IP_IFACE_METHOD_PCAP, IP_IFACE_METHOD_LINUX_TUN, IP_IFACE_METHOD_CUSTOM, 
 #endif
 
 #define IP_V4_BROADCAST_ADDRESS (0xFFFFFFFFul)
+#define IP_ETHERNET_BROADCAST_ADDRESS { 255, 255, 255, 255, 255, 255, }
 
 #define IP_NELEMS(X) (sizeof((X)) / sizeof((X)[0]))
 #define IP_UNUSED(X) ((void)(X))
+
+#define IPV4(A, B, C, D) ((((A) & 255) << 24) | (((B) & 255) << 16) | (((C) & 255) <<  8) | (((D) & 255) <<  0))
+
+#define IP_MAX(X, Y) ((X) < (Y) ? (Y) : (X))
+#define IP_MIN(X, Y) ((X) > (Y) ? (Y) : (X))
+
+#define IP_NL "\n"
+#define IP_IN "\t"
 
 enum { IP_ARP_CACHE_ENTRY_UNUSED, IP_ARP_CACHE_ENTRY_WAITING, IP_ARP_CACHE_ENTRY_ACTIVE, IP_ARP_CACHE_ENTRY_STATIC, };
 
@@ -93,13 +105,14 @@ typedef struct {
 
 	uint32_t ipv4_interface, ipv4_default_gateway, ipv4_netmask;
 	uint8_t mac[6];
+	long ipv4_ttl;
 
 	ip_arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
 	unsigned long arp_cache_timeout_ms;
 
 	int fatal; /* fatal error occurred, we should exit gracefully */
 	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
-	unsigned log_level; /* level to log at */
+	long log_level; /* level to log at */
 } ip_stack_t;
 
 enum { IP_LOG_FATAL, IP_LOG_ERROR, IP_LOG_WARNING, IP_LOG_INFO, IP_LOG_DEBUG, };
@@ -127,6 +140,33 @@ static int ip_log(ip_stack_t *ip, int fatal, unsigned level, const char *func, u
 		ip->fatal = line;
 	} else if (fatal) {
 		exit(1);
+	}
+	return 0;
+}
+
+static int ip_printf(const char *fmt, ...) {
+	assert(fmt);
+	if (!CONFIG_IP_PRINT_ENABLE)
+		return 0;
+	FILE *out = stderr;
+	va_list ap;
+	va_start(ap, fmt);
+	const int r = vfprintf(out, fmt, ap);
+	va_end(ap);
+	return r < 0 ? -1 : 0;
+}
+
+static inline int ip_dump(const char *banner, const unsigned char *m, size_t len) {
+	assert(banner);
+	assert(m);
+	const size_t col = 16;
+	if (ip_printf("\n%s\nLEN: %d\n", banner, (int)len) < 0) return -1;
+	for (size_t i = 0; i < len; i += col) {
+		if (ip_printf("%04X: ", (unsigned)i) < 0) return -1;
+		for (size_t j = i; j < len && j < (i + col); j++) {
+			if (ip_printf("%02X ", (unsigned)m[j]) < 0) return -1;
+		}
+		if (ip_printf("\n") < 0) return -1;
 	}
 	return 0;
 }
@@ -208,7 +248,7 @@ static int ip_v4addr(const char *s, uint32_t *addr) {
 static int ip_v4addr_to_string(uint32_t addr, char *s, size_t len) {
 	assert(s);
 	int ip[4] = { (addr >> 24) & 255, (addr >> 16) & 255, (addr >> 8) & 255, (addr >> 0) & 255, };
-	return snprintf(s, len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[4]);
+	return snprintf(s, len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 }
 
 // TODO: Check / unit test these functions
@@ -273,24 +313,17 @@ static inline uint64_t ip_ntohll_b(const uint8_t *buf) {
 	return ip_htonll(x);
 }
 
-static int ip_printf(const char *fmt, ...) {
-	assert(fmt);
-	if (!CONFIG_IP_PRINT_ENABLE)
-		return 0;
-	FILE *out = stderr;
-	va_list ap;
-	va_start(ap, fmt);
-	const int r = vfprintf(out, fmt, ap);
-	va_end(ap);
-	return r < 0 ? -1 : 0;
+static void ip_serdes_start(const char *name, size_t packet_len, int serialize) {
+	assert(name);
+	if (serialize < 0)
+		ip_printf("%s -- %zu" IP_NL, name, packet_len);
 }
 
-// TODO: Add name field to all serdes structs.
 static inline void ip_u8_buf_serdes(uint8_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
 	if (serialize < 0) {
-		(void)ip_printf("u8:%x ", *x);
+		(void)ip_printf(IP_IN "u8:%x" IP_NL, *x);
 		return;
 	}
 	if (serialize) {
@@ -304,7 +337,7 @@ static inline void ip_u16_buf_serdes(uint16_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
 	if (serialize < 0) {
-		(void)ip_printf("u16:%x ", *x);
+		(void)ip_printf(IP_IN "u16:%x" IP_NL, *x);
 		return;
 	}
 	if (serialize) {
@@ -318,7 +351,7 @@ static inline void ip_u32_buf_serdes(uint32_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
 	if (serialize < 0) {
-		(void)ip_printf("u32:%lx ", *x);
+		(void)ip_printf(IP_IN "u32:%lx" IP_NL, *x);
 		return;
 	}
 	if (serialize) {
@@ -332,7 +365,7 @@ static inline void ip_u64_buf_serdes(uint64_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
 	if (serialize < 0) {
-		(void)ip_printf("u64:%llx ", *x);
+		(void)ip_printf(IP_IN "u64:%llx" IP_NL, *x);
 		return;
 	}
 	if (serialize) {
@@ -346,11 +379,11 @@ static inline void ip_memory_serdes(uint8_t *structure, uint8_t *network, size_t
 	assert(structure);
 	assert(network);
 	if (serialize < 0) {
-		(void)ip_printf("u8[%zu]:", length);
+		(void)ip_printf(IP_IN "u8[%zu]:", length);
 		for (size_t i = 0; i < length; i++) {
 			(void)ip_printf("%x,", structure[i]);
 		}
-		(void)ip_printf(" ", length);
+		(void)ip_printf(IP_NL, length);
 		return;
 	}
 	if (serialize) {
@@ -401,15 +434,16 @@ static int ip_timer_reset_ms(ip_stack_t *ip, ip_timer_t *t, unsigned ms) {
 	return ip_timer_start_ms(ip, t, ms);
 }
 
-// TODO: Handle WiFi frames as well
 static int ip_ethernet_header_serdes(ip_ethernet_t *e, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(e);
 	assert(buf);
 	if (buf_len < IP_ETHERNET_HEADER_BYTE_COUNT)
 		return -1;
-	/* TODO: If these structures are packed we can replace this with a
+	/* If these structures are packed we can replace this with a
 	single memcpy and then ntohX/htonX functions, if the host is in
-	network order, those function calls to ntohX/htonX can be elided. */
+	network order, those function calls to ntohX/htonX can be elided, if
+	we are clever we could get the compiler to optimize this out. */
+	ip_serdes_start("ethernet", buf_len, serialize);
 	ip_memory_serdes(e->source,      buf + 0, 6, serialize);
 	ip_memory_serdes(e->destination, buf + 6, 6, serialize);
 	ip_u16_buf_serdes(&e->type, buf + 12, serialize);
@@ -421,6 +455,7 @@ static int ip_ipv4_header_serdes(ip_ipv4_t *i, uint8_t *buf, size_t buf_len, int
 	assert(buf);
 	if (buf_len < IP_HEADER_BYTE_COUNT)
 		return -1;
+	ip_serdes_start("ipv4", buf_len, serialize);
 	ip_u8_buf_serdes(&i->vhl,    buf +  0, serialize);
 	ip_u8_buf_serdes(&i->tos,    buf +  1, serialize);
 	ip_u16_buf_serdes(&i->len,   buf +  2, serialize);
@@ -439,14 +474,15 @@ static int ip_arp_header_serdes(ip_arp_t *arp, uint8_t *buf, size_t buf_len, int
 	assert(buf);
 	if (buf_len < IP_ARP_HEADER_BYTE_COUNT)
 		return -1;
-	ip_u16_buf_serdes(&arp->hw,     buf +  0, serialize);
-	ip_u16_buf_serdes(&arp->proto,  buf +  2, serialize);
-	ip_u8_buf_serdes(&arp->hlen,    buf +  4, serialize);
-	ip_u8_buf_serdes(&arp->plen,    buf +  5, serialize);
-	ip_u16_buf_serdes(&arp->op,     buf +  6, serialize);
-	ip_memory_serdes(arp->shw,      buf +  8, 6, serialize);
+	ip_serdes_start("arp", buf_len, serialize);
+	ip_u16_buf_serdes(&arp->hw,     buf +   0, serialize);
+	ip_u16_buf_serdes(&arp->proto,  buf +   2, serialize);
+	ip_u8_buf_serdes(&arp->hlen,    buf +   4, serialize);
+	ip_u8_buf_serdes(&arp->plen,    buf +   5, serialize);
+	ip_u16_buf_serdes(&arp->op,     buf +   6, serialize);
+	ip_memory_serdes(arp->shw,      buf +   8, 6, serialize);
 	ip_u32_buf_serdes(&arp->sp,     buf +  14, serialize);
-	ip_memory_serdes(arp->thw,      buf +  20, 6, serialize);
+	ip_memory_serdes(arp->thw,      buf +  18, 6, serialize);
 	ip_u32_buf_serdes(&arp->tp,     buf +  24, serialize);
 	return IP_ARP_HEADER_BYTE_COUNT;
 }
@@ -456,6 +492,7 @@ static int ip_icmp_header_serdes(ip_icmp_t *icmp, uint8_t *buf, size_t buf_len, 
 	assert(buf);
 	if (buf_len < IP_ICMP_HEADER_BYTE_COUNT)
 		return -1;
+	ip_serdes_start("icmp", buf_len, serialize);
 	ip_u8_buf_serdes(&icmp->type,      buf +  0, serialize);
 	ip_u8_buf_serdes(&icmp->code,      buf +  1, serialize);
 	ip_u16_buf_serdes(&icmp->checksum, buf +  2, serialize);
@@ -468,6 +505,7 @@ static int ip_udp_header_serdes(ip_udp_t *udp, uint8_t *buf, size_t buf_len, int
 	assert(buf);
 	if (buf_len < IP_UDP_HEADER_BYTE_COUNT)
 		return -1;
+	ip_serdes_start("udp", buf_len, serialize);
 	ip_u16_buf_serdes(&udp->source,      buf +  0, serialize);
 	ip_u16_buf_serdes(&udp->destination, buf +  2, serialize);
 	ip_u16_buf_serdes(&udp->length,      buf +  4, serialize);
@@ -480,6 +518,7 @@ static int ip_tcp_header_serdes(ip_tcp_t *tcp, uint8_t *buf, size_t buf_len, int
 	assert(buf);
 	if (buf_len < IP_TCP_HEADER_BYTE_COUNT)
 		return -1;
+	ip_serdes_start("tcp", buf_len, serialize);
 	ip_u16_buf_serdes(&tcp->source,      buf +  0, serialize);
 	ip_u16_buf_serdes(&tcp->destination, buf +  2, serialize);
 	ip_u32_buf_serdes(&tcp->seq,         buf +  4, serialize);
@@ -498,6 +537,7 @@ static int ip_ntp_header_serdes(ip_ntp_t *ntp, uint8_t *buf, size_t buf_len, int
 	assert(buf);
 	if (buf_len < IP_NTP_HEADER_BYTE_COUNT)
 		return -1;
+	ip_serdes_start("ntp", buf_len, serialize);
 	ip_u8_buf_serdes(&ntp->livnm,        buf +  0, serialize);
 	ip_u8_buf_serdes(&ntp->stratum,      buf +  1, serialize);
 	ip_u8_buf_serdes(&ntp->poll,         buf +  2, serialize);
@@ -516,17 +556,38 @@ static int ip_ntp_header_serdes(ip_ntp_t *ntp, uint8_t *buf, size_t buf_len, int
 static int ip_arp_cache_entry_serdes(ip_arp_cache_entry_t *arp, uint8_t *buf, size_t buf_len, int serialize) {
 	assert(arp);
 	assert(buf);
-
 	if (buf_len < IP_ARP_CACHE_ENTRY_BYTE_COUNT)
 		return -1;
-
-	// TODO: Serialize timer?
-	/*ip_u32_buf_serdes(&arp->ttl_ms, buf +  0, serialize);*/
+	ip_serdes_start("arp-cache", buf_len, serialize);
+	/*ip_u32_buf_serdes(&arp->ttl_ms, buf +  0, serialize); // We could serialize the timer as well */
 	ip_u32_buf_serdes(&arp->ipv4,   buf +  4, serialize);
 	ip_memory_serdes(arp->mac,      buf +  8, 6, serialize);
 	ip_u8_buf_serdes(&arp->state,   buf + 14, serialize);
 
 	return IP_ARP_CACHE_ENTRY_BYTE_COUNT;
+}
+
+static int ip_dhcp_header_serdes(ip_dhcp_t *dhcp, uint8_t *buf, size_t buf_len, int serialize) {
+	assert(dhcp);
+	assert(buf);
+	if (buf_len < IP_DHCP_HEADER_BYTE_COUNT)
+		return -1;
+	ip_serdes_start("dhcp", buf_len, serialize);
+	ip_u8_buf_serdes(&dhcp->op,       buf +   0, serialize);
+	ip_u8_buf_serdes(&dhcp->htype,    buf +   1, serialize);
+	ip_u8_buf_serdes(&dhcp->hlen,     buf +   2, serialize);
+	ip_u8_buf_serdes(&dhcp->hops,     buf +   3, serialize);
+	ip_u32_buf_serdes(&dhcp->xid,     buf +   4, serialize);
+	ip_u16_buf_serdes(&dhcp->secs,    buf +   8, serialize);
+	ip_u16_buf_serdes(&dhcp->flags,   buf +  10, serialize);
+	ip_u32_buf_serdes(&dhcp->ciaddr,  buf +  12, serialize);
+	ip_u32_buf_serdes(&dhcp->yiaddr,  buf +  16, serialize);
+	ip_u32_buf_serdes(&dhcp->siaddr,  buf +  20, serialize);
+	ip_u32_buf_serdes(&dhcp->giaddr,  buf +  24, serialize);
+	ip_memory_serdes(dhcp->chaddr,    buf +  28, 16, serialize);
+	ip_memory_serdes(dhcp->opts,      buf +  44, 192, serialize);
+	ip_u32_buf_serdes(&dhcp->magic_cookie,  buf +  236, serialize);
+	return IP_DHCP_HEADER_BYTE_COUNT; /* TLV options, if any, follow the header */
 }
 
 static int ip_udp_tx(ip_stack_t *ip, ip_udp_t *udp, uint8_t *buf, size_t buf_len) {
@@ -570,6 +631,73 @@ static int ip_arp_find(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t 
 	return -1;
 }
 
+static int ip_arp_set(ip_stack_t *ip, ip_arp_cache_entry_t *arp, uint32_t ipv4, int static_addr, uint8_t mac[6]) {
+	assert(arp);
+	assert(mac);
+	/*assert(ip_arp_find(ip, arps, len, ipv4) < 0);*/
+	ip_arp_clear(arp);
+	arp->ipv4 = ipv4;
+	memcpy(arp->mac, mac, 6);
+	if (ip_timer_start_ms(ip, &arp->timer, ip->arp_cache_timeout_ms) < 0) {
+		ip_fatal(ip, "failed to set timer");
+		return -1;
+	}
+	arp->state = IP_ARP_CACHE_ENTRY_ACTIVE;
+	if (static_addr)
+		arp->state = IP_ARP_CACHE_ENTRY_STATIC;
+	return 0;
+}
+
+static int ip_arp_find_free(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len) {
+	assert(ip);
+	assert(arps);
+	for (size_t i = 0; i < len; i++) {
+		ip_arp_cache_entry_t *arp = &arps[i];
+		if (arp->state == IP_ARP_CACHE_ENTRY_STATIC)
+			continue;
+		if (arp->state == IP_ARP_CACHE_ENTRY_UNUSED)
+			return i;
+		if (ip_arp_timed_out(ip, arp)) {
+			ip_arp_clear(arp);
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int ip_mac_to_string(const uint8_t *mac, size_t mac_len, char *buf, size_t buf_len) {
+	assert(mac);
+	assert(buf_len);
+	if (buf_len < ((mac_len * 3) + 1)) /* no accounting for overflow... */
+		return -1;
+	for (size_t i = 0; i < mac_len; i++) {
+		int c = i == (mac_len - 1) ? 0 : ':';
+		if (sprintf(&buf[i * 3], "%02X%c", mac[i], c) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+static int ip_arp_insert(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len, const uint32_t ipv4, int static_addr, uint8_t mac[6]) {
+	assert(ip);
+	assert(arps);
+	assert(mac);
+	if (ip_arp_find(ip, arps, len, ipv4) >= 0)
+		return 0;
+	static const uint8_t broadcast[6] = IP_ETHERNET_BROADCAST_ADDRESS;
+	if (!memcmp(mac, broadcast, 6))
+		return 0;
+	const int i = ip_arp_find_free(ip, arps, len);
+	if (i < 0) {
+		/* We could force replace an entry, or not, either option
+		 * has problems. The solution is a bigger ARP table. */
+		ip_error(ip, "ARP cache full");
+		return -1;
+	}
+	assert((unsigned)i < len);
+	return ip_arp_set(ip, &arps[i], ipv4, static_addr, mac);
+}
+
 static int ip_arp_rfind(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len, uint8_t mac[6]) {
 	assert(ip);
 	assert(arps);
@@ -585,7 +713,6 @@ static int ip_arp_rfind(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t
 	}
 	return -1;
 }
-
 
 #if 0
 /* OS Dependent functions */
@@ -705,22 +832,6 @@ fail:
 	return -1;
 }
 
-static inline int ip_dump(FILE *out, const char *banner, const unsigned char *m, size_t len) {
-	assert(out);
-	assert(banner);
-	assert(m);
-	const size_t col = 16;
-	if (fprintf(stderr, "\n%s\nLEN: %d\n", banner, (int)len) < 0) return -1;
-	for (size_t i = 0; i < len; i += col) {
-		if (fprintf(stderr, "%04X: ", (unsigned)i) < 0) return -1;
-		for (size_t j = i; j < len && j < (i + col); j++) {
-			if (fprintf(stderr, "%02X ", (unsigned)m[j]) < 0) return -1;
-		}
-		if (fprintf(stderr, "\n") < 0) return -1;
-	}
-	return 0;
-}
-
 static long ip_pcap_ethernet_poll(pcap_t *handle, unsigned char *memory, int max) {
 	assert(handle);
 	assert(memory);
@@ -732,14 +843,20 @@ static long ip_pcap_ethernet_poll(pcap_t *handle, unsigned char *memory, int max
 	int len = header->len;
 	len = len > max ? max : len;
 	memcpy(memory, packet, len);
-	/*ip_dump(stdout, "ETH RX", packet, len);*/
+	/*ip_dump("ETH RX", packet, len);*/
 	return len;
 }
 
 static int ip_pcap_ethernet_tx(pcap_t *handle, unsigned char *memory, int len) {
 	assert(handle);
 	assert(memory);
-	return pcap_sendpacket(handle, memory, len);
+	const int r = pcap_sendpacket(handle, memory, len);
+	if (r < 0) {
+		/*char errbuf[PCAP_ERRBUF_SIZE] = { 0, };
+		pcap_perror(handle, errbuf);
+		(void)fprintf(stderr, "pcap tx -- %s\n", errbuf);*/
+	}
+	return r;
 }
 
 static long ip_ethernet_rx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
@@ -781,41 +898,218 @@ static int ip_stack_deinit(ip_stack_t *ip) {
 #error "No valid network C API available"
 #endif
 
+static int ip_arp_state_machine(ip_stack_t *ip) {
+	assert(ip);
+	return 0;
+}
+
+static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
+	assert(ip);
+	/* Send ARP Req -> Wait -> Send Message */
+	return 0;
+}
+
+static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6]) {
+	assert(ip);
+	assert(tx);
+	assert(mac_src);
+	assert(mac_dst);
+	ip_ethernet_t e = { .type = IP_ETHERNET_TYPE_ARP, };
+	memcpy(e.source, mac_src, 6);
+	memcpy(e.destination, mac_dst, 6);
+	const int r1 = ip_ethernet_header_serdes(&e, tx, tx_len, 1);
+	if (r1 < 0) {
+		ip_error(ip, "ethernet serdes failed");
+		return -1;
+	}
+	ip_arp_t a = {
+		.hw = 1,
+		.proto = 0x0800,
+		.hlen = 6,
+		.plen = 4,
+		.op = 1, /* request = 1, response = 2 */
+	};
+	memcpy(a.shw, mac_src, 6);
+	memcpy(a.thw, mac_dst, 6);
+	a.sp = ipv4_src;
+	a.tp = ipv4_dst;
+	const int r2 = ip_arp_header_serdes(&a, &tx[r1], tx_len - r1, 1);
+	if (r2 < 0) {
+		ip_error(ip, "ARP serdes failed");
+		return -1;
+	}
+	return r1 + r2;
+}
+
+static int ip_arp_req(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6]) {
+	assert(ip);
+	assert(tx);
+	assert(mac_src);
+	assert(mac_dst);
+	const int len = ip_arp_format(ip, tx, tx_len, ipv4_src, ipv4_dst, mac_src, mac_dst);
+	if (len < 0)
+		return -1;
+	return ip_ethernet_tx(ip, tx, len);
+}
+
+static int ip_arp_who_has_req(ip_stack_t *ip, uint32_t ipv4) {
+	assert(ip);
+	static const uint8_t mac_dst[6] = IP_ETHERNET_BROADCAST_ADDRESS;
+	return ip_arp_req(ip, ip->tx, ip->tx_len, ip->ipv4_interface, ipv4, ip->mac, mac_dst);
+}
+
+static int ip_arp_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
+	assert(ip);
+	assert(packet);
+	ip_arp_t arp = { .hw = 0, };
+	if (ip_arp_header_serdes(&arp, packet, len, 0) < 0) {
+		ip_error(ip, "ARP packet deserialize failed");
+		return -1;
+	}
+	ip_arp_header_serdes(&arp, packet, len, -1);
+	if (arp.hw != 1) {
+		ip_info(ip, "unknown ARP `hw` field: %d", arp.hw);
+		return 0;
+	}
+	if (arp.proto != 0x0800) {
+		ip_info(ip, "unknown ARP `proto` field: %d", arp.proto);
+		return 0;
+	}
+	if (arp.hlen != 6) {
+		ip_info(ip, "unknown ARP `hlen` field: %d", arp.hlen);
+		return 0;
+	}
+	if (arp.plen != 4) {
+		ip_info(ip, "unknown ARP `plen` field: %d", arp.plen);
+		return 0;
+	}
+	if (arp.op != 2) {
+		/* does not matter */
+	}
+	if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), arp.sp, 0, arp.shw) < 0) {
+		ip_error(ip, "ARP insert failed");
+		return -1;
+	}
+	/* We could filter out our own address, but it should not matter */
+	if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), arp.tp, 0, arp.thw) < 0) {
+		ip_error(ip, "ARP insert failed");
+		return -1;
+	}
+	return 0;
+}
+
+static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
+	assert(ip);
+	assert(packet);
+	ip_ipv4_t v4 = { .vhl = 0, };
+	if (ip_ipv4_header_serdes(&v4, packet, len, 0) < 0) {
+		ip_error(ip, "IPv4 packet deserialize failed");
+		return -1;
+	}
+	const uint8_t ver = v4.vhl & 0xFu, ihl = (v4.vhl) >> 4 & 0xFu;
+	if (ver != 4) {
+		ip_error(ip, "IPv4 version is not 4: %d", ver);
+		return -1;
+	}
+	const size_t header_bytes = ihl * 4;
+	if (header_bytes < 20 || header_bytes > len) {
+		ip_error(ip, "IPv4 header size (bytes) invalid: %zu", header_bytes);
+		return -1;
+	}
+	if (v4.len > len) {
+		ip_error(ip, "IPv4 packet too big %d > %zu", v4.len, len);
+		return -1;
+	}
+	if (v4.ttl == 0) {
+		/* do not care unless we are routing */
+	}
+	// TODO: Handle fragments, source/dest, checksum
+	switch (v4.proto) {
+	case IP_V4_PROTO_ICMP:
+		break;
+	case IP_V4_PROTO_TCP:
+		break;
+	case IP_V4_PROTO_UDP:
+		break;
+	default:
+		ip_warn(ip, "IPv4 unknown proto: %d", v4.proto);
+		break;
+	}
+	return 0;
+}
+
+static int ip_rx_packet_handler(ip_stack_t *ip) { /* return 1 if work has been done */
+	assert(ip);
+	const int r = ip_ethernet_rx(ip, ip->rx, ip->rx_len);
+	if (r < 0) {
+		ip_error(ip, "packet rx error");
+		return 1; /* did something */
+	} 
+	if (r == 0) {
+		long sleep_ms = 10;
+		(void)ip_sleep(ip, &sleep_ms);
+		return 0;
+	} 
+	/* got packet, r == packet length */
+	assert(r <= (long)ip->rx_len);
+	ip_debug(ip, "packet rx len %d", r);
+	ip_ethernet_t e = { .type = 0, };
+	const int s = ip_ethernet_header_serdes(&e, ip->rx, r, 0);
+	if (s < 0) {
+		ip_error(ip, "ethernet header serdes fail");
+		return 1; /* did something */
+	}
+	/* We could call custom handler callbacks here */
+	switch (e.type) {
+	case IP_ETHERNET_TYPE_IPV4: {
+		ip_debug(ip, "ipv4 packet received");
+		break;
+	}
+	case IP_ETHERNET_TYPE_ARP: {
+		ip_debug(ip, "arp packet received");
+		assert((r - s) <= r);
+		/*ip_dump("ARP PKT", &ip->rx[s], r - s);*/
+		ip_arp_cb(ip, &ip->rx[s], r - s);
+		break;
+	}
+	case IP_ETHERNET_TYPE_RARP: {
+		ip_debug(ip, "rarp packet received");
+		break;
+	}
+	case IP_ETHERNET_TYPE_IPV6: {
+		ip_debug(ip, "ipv6 packet received");
+		break;
+	}
+	default:
+		ip_info(ip, "ethernet no handler for %d", (int)e.type);
+		break;
+	}
+	return 1; /* did something */
+}
+
 static int ip_stack(ip_stack_t *ip) {
 	assert(ip);
 	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
 	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
+	ip_timer_t t1 = { .state = 0, };
+	ip_timer_start_ms(ip, &t1, 1000);
 	while (!ip->stop) {
-		const int r = ip_ethernet_rx(ip, ip->rx, ip->rx_len);
-		if (r < 0) {
-			ip_error(ip, "packet rx error");
-			continue;
-		} else if (r == 0) {
-			long sleep_ms = 10;
-			(void)ip_sleep(ip, &sleep_ms);
-			continue;
-		} else { /* got packet, r == packet length */
-			assert(r <= (long)ip->rx_len);
-			ip_debug(ip, "packet rx len %d", r);
-			ip_ethernet_t e = { .type = 0, };
-			const int s = ip_ethernet_header_serdes(&e, ip->rx, r, 0);
-			if (s < 0) {
-				ip_error(ip, "ethernet header serdes fail");
-				continue;
+			int need_sleep = 1;
+			if (ip_rx_packet_handler(ip))
+				need_sleep = 0;
+			if (ip_tx_state_machine(ip))
+				need_sleep = 0;
+			if (ip_timer_expired(ip, &t1)) {
+				const uint32_t ipv4 = IPV4(192, 168, 1, 143);
+				if (ip_arp_who_has_req(ip, ipv4) < 0) {
+					ip_error(ip, "ARP who has failed");
+				}
+				ip_timer_reset_ms(ip, &t1, 1000);
 			}
-			switch (e.type) {
-			case IP_ETHERNET_TYPE_IPV4:
-				break;
-			case IP_ETHERNET_TYPE_ARP:
-				break;
-			case IP_ETHERNET_TYPE_RARP:
-				break;
-			case IP_ETHERNET_TYPE_IPV6:
-				break;
-			default:
-				break;
+			if (need_sleep) {
+				long sleep_ms = 1;
+				(void)ip_sleep(ip, &sleep_ms);
 			}
-		}
 	}
 	return 0;
 }
@@ -860,7 +1154,7 @@ typedef struct { /* Used for parsing key=value strings (strings must be modifiab
 static int ip_flag(const char *v) {
 	assert(v);
 
-	static char *y[] = { "yes", "on", "true", };
+	static char *y[] = { "yes", "on",  "true",  };
 	static char *n[] = { "no",  "off", "false", };
 
 	for (size_t i = 0; i < IP_NELEMS(y); i++) {
@@ -1082,9 +1376,14 @@ static int ip_help(FILE *out, const char *arg0, ip_options_t *kv, size_t kvlen) 
 		"Author:  " IP_AUTHOR "\n"
 		"E-mail:  " IP_EMAIL "\n"
 		"Repo:    " IP_REPO "\n"
-		"License: " IP_LICENSE "\n" 
+		"License: " IP_LICENSE "\n\n" 
+		"This program is a demonstration for a networking stack. It is a work in progress.\n\n"
+		"Options:\n"
+		"\t-h : print this help message and exit\n"
+		"\t-o key=value : set a key value option\n"
+		"\t-t : run built in tests and exit\n"
+		"\t-v : increase verbosity level\n"
 		"\n"
-		"This program is a demonstration for a networking stack. It is a word in progress.\n"
 		"This program return zero on success and non-zero on failure.\n" 
 		"\n", arg0);
 	const int r2 = ip_options_help(kv, kvlen, out);
@@ -1134,39 +1433,69 @@ static int ip_putch(int c) {
 #error "Unsupported operating system"
 #endif
 
+static int ip_stack_info(ip_stack_t *ip, FILE *out) {
+	assert(ip);
+	assert(out);
+	char buf[IP_MAX(((6 * 3) + 1), 16+1)] = { 0, };
+	if (ip_mac_to_string(ip->mac, sizeof(ip->mac), buf, sizeof (buf)) < 0) return -1;
+	if (fprintf(out, "MAC: %s\n", buf) < 0) return -1;
+	if (ip_v4addr_to_string(ip->ipv4_interface, buf, sizeof (buf)) < 0) return -1;
+	if (fprintf(out, "IP:  %s\n", buf) < 0) return -1;
+	if (ip_v4addr_to_string(ip->ipv4_default_gateway, buf, sizeof (buf)) < 0) return -1;
+	if (fprintf(out, "Gate Way:  %s\n", buf) < 0) return -1;
+	if (ip_v4addr_to_string(ip->ipv4_netmask, buf, sizeof (buf)) < 0) return -1;
+	if (fprintf(out, "Net Mask:  %s\n", buf) < 0) return -1;
+
+	return 0;
+}
+
 // TODO: Command line interface (integrate <https://github.com/howerj/pickle>?
 // Or just make something quick and dirty?).
 int main(int argc, char **argv) {
+	/* Might need more buffers, or ways of partition these buffers, most
+	 * packets will not be 65536 bytes in size, or any of them... */
 	static uint8_t rx[65536], tx[65536];
 	char *interface = "lo";
 
 	static ip_stack_t stack = { 
-		.log_level             =  IP_LOG_DEBUG,                    
-		.os_sleep_ms           =  ip_os_sleep,                     
-		.os_time_ms            =  ip_os_time,                      
-		.ethernet_rx           =  ip_ethernet_rx_cb,               
-		.ethernet_tx           =  ip_ethernet_tx_cb,               
-		.ipv4_interface        =  CONFIG_IP_V4_DEFAULT,            
-		.ipv4_default_gateway  =  CONFIG_IP_V4_DEFAULT_GATEWAY,    
-		.rx                    =  rx,                              
-		.tx                    =  tx,                              
+		.log_level             =  IP_LOG_ERROR,
+		.os_sleep_ms           =  ip_os_sleep,
+		.os_time_ms            =  ip_os_time,
+		.ethernet_rx           =  ip_ethernet_rx_cb,
+		.ethernet_tx           =  ip_ethernet_tx_cb,
+		.ipv4_interface        =  CONFIG_IP_V4_DEFAULT,
+		.ipv4_default_gateway  =  CONFIG_IP_V4_DEFAULT_GATEWAY,
+		.ipv4_netmask          =  CONFIG_IP_V4_DEFAULT_NETMASK,
+		.ipv4_ttl              =  CONFIG_IP_TTL_DEFAULT,
+		.rx                    =  rx,
+		.tx                    =  tx,
 		.rx_len                =  sizeof(rx),
 		.tx_len                =  sizeof(tx),
-		.arp_cache_timeout_ms  =  CONFIG_IP_ARP_CACHE_TIMEOUT_MS,  
+		.arp_cache_timeout_ms  =  CONFIG_IP_ARP_CACHE_TIMEOUT_MS,
+		.mac                   =  CONFIG_IP_MAC_ADDR_DEFAULT,
 	}, *ip = &stack;
+	ip->error = stderr;
 
 	ip_options_t kv[] = {
-		{ .opt = "interface",    .v.s = &interface, .type = IP_OPTIONS_STRING_E, .help = "Set interface name", },
+		{ .opt = "interface",  .v.s = &interface,     .type = IP_OPTIONS_STRING_E, .help = "Set interface name", },
+		{ .opt = "log-level",  .v.n = &ip->log_level, .type = IP_OPTIONS_LONG_E,   .help = "Set log level directly", },
+		{ .opt = "ip-ttl",     .v.n = &ip->ipv4_ttl,  .type = IP_OPTIONS_LONG_E,   .help = "Set IP TTL level", },
 	};
 
 	ip_getopt_t opts = { .error = stderr, };
-	for (int ch = 0; (ch = ip_getopt(&opts, argc, argv, "hto:")) != -1;) {
+	for (int ch = 0; (ch = ip_getopt(&opts, argc, argv, "hto:v")) != -1;) {
 		switch (ch) {
 		case 'h': return ip_help(stderr, argv[0], &kv[0], IP_NELEMS(kv)) < 0;
 		case 't': return ip_tests() < 0; break;
 		case 'o': if (ip_options_set(&kv[0], IP_NELEMS(kv), opts.arg, stderr) < 0) return 1; break;
+		case 'v': ip->log_level++; break;
 		default: return 1;
 		}
+	}
+
+	if (ip_stack_info(ip, ip->error) < 0) {
+		ip_error(ip, "printing info failed");
+		return 1;
 	}
 
 	if (ip_stack_init(ip, interface) < 0) {
@@ -1175,7 +1504,7 @@ int main(int argc, char **argv) {
 	}
 	ip_info(ip, "initialization complete");
 
-	if (ip_stack(ip) < 0) {
+	if (ip_stack(ip) < 0) { /* This will block until finished */
 		ip_error(ip, "error running ip stack");
 	}
 

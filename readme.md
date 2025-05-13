@@ -3,9 +3,9 @@
 * Email: <mailto:howe.r.j.89@gmail.com>
 * Repo: <https://github.com/howerj/ip>
 
-**This project is a work in progress, it is currently not working**.
+**This project is a work in progress**.
 
-An attempt at a IPv4 UDP/TCP stack.
+An attempt at a IPv4 UDP/TCP stack. 
 
 Note that functions, structures and variables will have the `ip_` prefix as
 that is the name of the library. (e.g. `ip_ethernet_tx` transmits an Ethernet
@@ -13,8 +13,9 @@ frame, which is a separate layer which is independent of the IP protocol).
 
 To Do / Plan:
 
-* [ ] libpcap or TAP/TUN?
-* [ ] Headers for IPv4, IPv6, ICMP, UDP, TCP, ARP/NDP, DHCP, DNS, ...
+* [x] libpcap or TAP/TUN?
+* [x] Headers for IPv4, IPv6, ICMP, UDP, TCP, ARP/NDP, DHCP, DNS, ...
+* [ ] ARP
 * [ ] UDP
 * [ ] DHCP, DHCP TLV option parsing
 * [ ] ICMP

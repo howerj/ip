@@ -29,6 +29,12 @@ typedef struct {
 
 #define IP_ETHERNET_HEADER_BYTE_COUNT (14)
 
+enum {
+	IP_V4_PROTO_ICMP = 0x00u,
+	IP_V4_PROTO_TCP  = 0x06u,
+	IP_V4_PROTO_UDP  = 0x11u,
+};
+
 typedef struct {
 	uint8_t vhl;          /*  4 bit version and 4 bit header length */
 	uint8_t tos;          /*  8 bit type of service */
@@ -106,5 +112,29 @@ typedef struct {
 } ip_ntp_t;
 
 #define IP_NTP_HEADER_BYTE_COUNT (48)
+
+typedef struct {
+	uint8_t op;
+	uint8_t htype;
+	uint8_t hlen;
+	uint8_t hops;
+	uint32_t xid;
+	uint16_t secs;
+	uint16_t flags;
+	uint32_t ciaddr;
+	uint32_t yiaddr;
+	uint32_t siaddr;
+	uint32_t giaddr;
+	uint8_t chaddr[16];
+	uint8_t opts[192];
+	uint32_t magic_cookie;
+} ip_dhcp_t;
+
+#define IP_DHCP_HEADER_BYTE_COUNT (240)
+
+enum {
+	IP_DHCP_XID = 0x3903F326ul,
+	IP_DHCP_MAGIC_COOKIE = 0x63825363ul,
+};
 
 #endif
