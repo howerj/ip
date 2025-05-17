@@ -52,3 +52,17 @@ TCP algorithms, which are very useful in themselves, to be used in other custom
 protocols, or without the overhead of Ethernet (for example, TCP over a fast
 serial line). Allowing the protocol to be more customizable even if it breaks
 compatibility would be useful (by disabling algorithms selectively).
+
+# Notes
+
+Some commands:
+
+	ip link add br0 type bridge
+	ip tuntap add mode tap user ${USER} group ${GROUP} name tap0
+	ip tuntap add mode tap user ${USER} group ${GROUP} name tap1
+	ip link set tap0 master br0
+	ip link set tap1 master br0
+	ip link set dev tap0 up
+	ip link set dev tap1 up
+	ip link set dev br0 up
+

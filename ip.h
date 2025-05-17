@@ -22,8 +22,8 @@ enum { /* There are many more see <https://en.wikipedia.org/wiki/EtherType> */
 };
 
 typedef struct {
-	uint8_t source[6];
 	uint8_t destination[6];
+	uint8_t source[6];
 	uint16_t type;
 } ip_ethernet_t;
 
