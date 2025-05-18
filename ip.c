@@ -46,6 +46,14 @@
 #define CONFIG_IP_MAC_ADDR_DEFAULT { 0x60, 0x08, 0xAD, 0x7D, 0x47, 0xE2, }
 #endif
 
+#ifndef CONFIG_IP_ARP_RETRY_COUNT /* number of times to try and resolve an IP <-> MAC using ARP */
+#define CONFIG_IP_ARP_RETRY_COUNT (3)
+#endif
+
+#ifndef CONFIG_IP_ARP_TIMEOUT_MS
+#define CONFIG_IP_ARP_TIMEOUT_MS (1000)
+#endif
+
 #ifndef CONFIG_IP_TTL_DEFAULT /* Default IPv4 TTL */
 #define CONFIG_IP_TTL_DEFAULT (0x80u)
 #endif
@@ -115,12 +123,19 @@ typedef struct {
 	size_t rx_len, tx_len;
 
 	uint32_t ipv4_interface, ipv4_default_gateway, ipv4_netmask;
-	uint8_t mac[6];
 	long ipv4_ttl;
+	uint8_t mac[6];
 	uint16_t ip_id; /* IP Id field, increments each send */
 
 	ip_arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
 	unsigned long arp_cache_timeout_ms;
+	uint32_t arp_ipv4; /* IP address we want to link with a MAC addr */
+	int arp_state, /* ARP state machine */
+	    arp_retries,
+	    arp_opts; /* ARP options */
+	uint8_t *arp_buf;
+	size_t arp_buf_sz;
+	ip_timer_t arp_timer;
 
 	int fatal; /* fatal error occurred, we should exit gracefully */
 	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
@@ -323,7 +338,6 @@ static int ip_v4addr_to_string(uint32_t addr, char *s, size_t len) {
 	return snprintf(s, len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 }
 
-// TODO: Check / unit test these functions
 static inline void ip_htons_b(uint16_t x, uint8_t *buf) {
 	assert(buf);
 	x = ip_htons(x);
@@ -678,6 +692,21 @@ static int ip_dhcp_header_serdes(ip_dhcp_t *dhcp, uint8_t *buf, size_t buf_len, 
 	return IP_DHCP_HEADER_BYTE_COUNT; /* TLV options, if any, follow the header */
 }
 
+static int ip_dns_header_serdes(ip_dns_t *dns, uint8_t *buf, size_t buf_len, int serialize) {
+	assert(dns);
+	assert(buf);
+	if (buf_len < IP_DNS_HEADER_BYTE_COUNT)
+		return -1;
+	ip_serdes_start("dns", buf_len, serialize);
+	ip_u16_buf_serdes(&dns->transaction_id,         buf +  0, serialize);
+	ip_u16_buf_serdes(&dns->flags,                  buf +  2, serialize);
+	ip_u16_buf_serdes(&dns->num_of_questions,       buf +  4, serialize);
+	ip_u16_buf_serdes(&dns->num_of_answers,         buf +  6, serialize);
+	ip_u16_buf_serdes(&dns->num_of_authority_rrs,   buf +  8, serialize);
+	ip_u16_buf_serdes(&dns->num_of_additional_rrs,  buf + 10, serialize);
+	return IP_DNS_HEADER_BYTE_COUNT; /* Lots of information should follow this header... */
+}
+
 static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_udp_t *udp, const uint8_t *buf, size_t buf_len, uint8_t *tx, size_t tx_len) {
 	assert(ip);
 	assert(tx);
@@ -747,7 +776,7 @@ static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport,
 		.source = src,
 		.destination = dst,
 		.proto = 17,
-		.checksum = 0, // TODO
+		.checksum = 0, /* `ip_udp_format` handles this */
 		.frags = 0,
 		.id = ip->ip_id++,
 	};
@@ -755,7 +784,7 @@ static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport,
 		.source = sport,
 		.destination = tport,
 		.length = buf_len + IP_UDP_HEADER_BYTE_COUNT,
-		.checksum = 0, // TODO
+		.checksum = 0, /* `ip_udp_format` handles this */
 	};
 	const int r = ip_udp_format(ip, &e, &ipv4, &udp, buf, buf_len, ip->tx, ip->tx_len);
 	if (r < 0) {
@@ -843,13 +872,18 @@ static int ip_mac_to_string(const uint8_t *mac, size_t mac_len, char *buf, size_
 	return 0;
 }
 
+#define IP_ARP_NO_INSERT_EMPTY (0)
 static int ip_arp_do_no_insert(const uint8_t mac[6]) {
 	assert(mac);
-	static const uint8_t broadcast[6] = IP_ETHERNET_BROADCAST_ADDRESS, empty[6] = IP_ETHERNET_EMPTY_ADDRESS;
+	static const uint8_t broadcast[6] = IP_ETHERNET_BROADCAST_ADDRESS;
 	if (!memcmp(mac, broadcast, 6))
 		return 1;
-	if (!memcmp(mac, empty, 6))
-		return 1;
+	/* Empty address is sometimes used (for loop back interfaces) */
+	if (IP_ARP_NO_INSERT_EMPTY) {
+		static const uint8_t empty[6] = IP_ETHERNET_EMPTY_ADDRESS;
+		if (!memcmp(mac, empty, 6))
+			return 1;
+	}
 	return 0;
 }
 
@@ -858,10 +892,16 @@ static int ip_arp_insert(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_
 	assert(arps);
 	assert(mac);
 	assert(IP_NELEMS(ip->arp_cache) < INT_MAX);
-	if (ip_arp_find(ip, arps, len, ipv4) >= 0)
-		return 0;
 	if (ip_arp_do_no_insert(mac))
 		return 0;
+	const int r = ip_arp_find(ip, arps, len, ipv4);
+	if (r >= 0) {
+		if (ip_timer_reset_ms(ip, &ip->arp_cache[r].timer, ip->arp_cache_timeout_ms) < 0) {
+			ip_fatal(ip, "ARP timer reset failed");
+			return -1;
+		}
+		return 0;
+	}
 	const int i = ip_arp_find_free(ip, arps, len);
 	if (i < 0) {
 		/* We could force replace an entry, or not, either option
@@ -936,8 +976,8 @@ static int ip_pcapdev_init(ip_stack_t *ip, const char *name, pcap_t **handle) {
 		if (!device->name)
 			continue;
 		int usable = 0;
-		for (pcap_addr_t *addr = device->addresses; addr; addr = addr->next) // TODO: AF_INET usable?
-			if (addr->addr->sa_family == AF_INET) //|| addr->addr->sa_family == AF_PACKET)
+		for (pcap_addr_t *addr = device->addresses; addr; addr = addr->next)
+			if (addr->addr->sa_family == AF_INET || addr->addr->sa_family == AF_PACKET)
 				usable = 1;
 		ip_info(ip, "%s usable=%s", device->name, usable ? "yes" : "no");
 		if (!strcmp(device->name, name)) {
@@ -1152,19 +1192,6 @@ static int ip_stack_deinit(ip_stack_t *ip) {
 #error "No valid network C API available"
 #endif
 
-static int ip_arp_state_machine(ip_stack_t *ip) {
-	assert(ip);
-	// TODO
-	return 0;
-}
-
-static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
-	assert(ip);
-	/* Send ARP Req -> Wait -> Send Message */
-	// TODO
-	return 0;
-}
-
 static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6], int op) {
 	assert(ip);
 	assert(tx);
@@ -1212,6 +1239,8 @@ static int ip_arp_req(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_
 // TODO: Options to disable ARP and sending Ethernet packets generally
 static int ip_arp_who_has_req(ip_stack_t *ip, uint32_t ipv4) {
 	assert(ip);
+	if (ip_arp_find(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), ipv4) >= 0) /* redundant request */
+		return 0;
 	static const uint8_t mac_dst[6] = IP_ETHERNET_BROADCAST_ADDRESS;
 	uint8_t buf[128];
 	return ip_arp_req(ip, buf, sizeof(buf), ip->ipv4_interface, ipv4, ip->mac, mac_dst, 1);
@@ -1265,6 +1294,78 @@ static int ip_arp_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	return r;
 }
 
+static int ip_arp_state_machine(ip_stack_t *ip) {
+	assert(ip);
+
+	enum { WAIT, SEND, RESP, FATAL, };
+
+	const int s = ip->arp_state;
+	int next = s, r = 0;
+
+	/* TODO: ARP options: Broadcast, Do not bother with ARP, pull from queue, block until ARP'ed */
+
+	switch (s) {
+	case WAIT:
+		if (ip->arp_ipv4)
+			next = SEND;
+		break;
+	case SEND:
+		next = RESP;
+		r = 1;
+		if (ip_arp_who_has_req(ip, ip->arp_ipv4) < 0) {
+			ip_error(ip, "ARP TX failed");
+			next = SEND;
+		}
+		if (ip_timer_start_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_CACHE_TIMEOUT_MS) < 0) {
+			ip_fatal(ip, "ARP timer start failed");
+			r = -1;
+		}
+		ip->arp_retries = 0;
+		break;
+	case RESP: {
+		const int found = ip_arp_find(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), ip->arp_ipv4);
+		if (found >= 0) {
+			ip->arp_ipv4 = 0;
+			next = WAIT;
+		} else if (ip_timer_expired(ip, &ip->arp_timer)) {
+			if (ip_timer_reset_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_CACHE_TIMEOUT_MS) < 0) {
+				ip_fatal(ip, "ARP timer failed");
+				r = -1;
+				break;
+			}
+			ip->arp_retries++;
+			next = SEND;
+			if (ip->arp_retries >= CONFIG_IP_ARP_RETRY_COUNT) {
+				ip_error(ip, "ARP failed to resolve address %lu", (unsigned long)ip->arp_ipv4);
+				next = WAIT;
+			} else {
+				ip_warn(ip, "ARP timer expired, retrying");
+			}
+		}
+		break;
+	case FATAL:
+		r = -1;
+		break;
+	}
+	default:
+		ip_fatal(ip, "invalid ARP state %d", s);
+		r = -1;
+		break;
+	}
+	if (ip->fatal)
+		next = FATAL;
+	ip->arp_state = next;
+	return r;
+}
+
+static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
+	assert(ip);
+	/* Send ARP Req -> Wait -> Send Message */
+	// TODO
+	enum { WAIT, ARP, TX, };
+	return 0;
+}
+
 static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	assert(ip);
 	assert(packet);
@@ -1273,12 +1374,12 @@ static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 		ip_error(ip, "IPv4 packet deserialize failed");
 		return -1;
 	}
-	const uint8_t ver = v4.vhl & 0xFu, ihl = (v4.vhl) >> 4 & 0xFu;
+	const uint8_t ver = (v4.vhl >> 4) & 0xFu, ihl = (v4.vhl >> 0) & 0xFu;
 	if (ver != 4) {
 		ip_error(ip, "IPv4 version is not 4: %d", ver);
 		return -1;
 	}
-	const size_t header_bytes = ihl * 4;
+	const size_t header_bytes = ihl * sizeof(uint32_t);
 	if (header_bytes < 20 || header_bytes > len) {
 		ip_error(ip, "IPv4 header size (bytes) invalid: %zu", header_bytes);
 		return -1;
@@ -1287,16 +1388,19 @@ static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 		ip_error(ip, "IPv4 packet too big %d > %zu", v4.len, len);
 		return -1;
 	}
-	if (v4.ttl == 0) {
-		/* do not care unless we are routing */
+	if (v4.ttl == 0) { /* do not care unless we are routing */
+		ip_warn(ip, "IPv4 TTL is zero"); /* Like tears in rain. Time to die. Or not in this case. */
 	}
-	// TODO: Handle fragments, source/dest, checksum
+	// TODO: Handle fragments, 
 	switch (v4.proto) {
 	case IP_V4_PROTO_ICMP:
+		ip_debug(ip, "IPv4 ICMP Packet RX");
 		break;
 	case IP_V4_PROTO_TCP:
+		ip_debug(ip, "IPv4 TCP Packet RX");
 		break;
 	case IP_V4_PROTO_UDP:
+		ip_debug(ip, "IPv4 UDP Packet RX");
 		break;
 	default:
 		ip_warn(ip, "IPv4 unknown proto: %d", v4.proto);
@@ -1313,8 +1417,6 @@ static int ip_rx_packet_handler(ip_stack_t *ip) { /* return 1 if work has been d
 		return 1; /* did something */
 	} 
 	if (r == 0) {
-		long sleep_ms = 10;
-		(void)ip_sleep(ip, &sleep_ms);
 		return 0;
 	} 
 	/* got packet, r == packet length */
@@ -1326,18 +1428,24 @@ static int ip_rx_packet_handler(ip_stack_t *ip) { /* return 1 if work has been d
 		ip_error(ip, "ethernet header serdes fail");
 		return 1; /* did something */
 	}
+	// TODO: refresh ARP table
+	//if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), 
+
 	/* We could call custom handler callbacks here */
 	switch (e.type) {
 	case IP_ETHERNET_TYPE_IPV4: {
 		ip_debug(ip, "ipv4 packet received");
 		ip_dump("IPv4 PKT", &ip->rx[s], r - s);
+		if (ip_ipv4_cb(ip, &ip->rx[s], r - s) < 0)
+			return -1;
 		break;
 	}
 	case IP_ETHERNET_TYPE_ARP: {
 		ip_debug(ip, "arp packet received");
 		assert((r - s) <= r);
 		ip_dump("ARP PKT", &ip->rx[s], r - s);
-		ip_arp_cb(ip, &ip->rx[s], r - s);
+		if (ip_arp_cb(ip, &ip->rx[s], r - s) < 0)
+			return -1;
 		break;
 	}
 	case IP_ETHERNET_TYPE_IPV6: {
@@ -1352,19 +1460,37 @@ static int ip_rx_packet_handler(ip_stack_t *ip) { /* return 1 if work has been d
 	return 1; /* did something */
 }
 
+static inline int ip_stack_finished(ip_stack_t *ip) {
+	assert(ip);
+	if (ip->stop)
+		return 1;
+	return ip->fatal ? -1 : 0;
+}
+
 static int ip_stack(ip_stack_t *ip) {
 	assert(ip);
 	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
 	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
 	// TODO: ARP state-machine WAIT -> REQUEST -> RESPONSE -> WAIT, handle timeouts, retry
 	// TODO: Generic packet queue, waiting on ARP queue, ...
+	// 
+	// ARP Options: do not bother, broadcast, queue up UDP packets until
+	// ARP response received. Need retries and timeout and ARP requests.
 	ip_timer_t t1 = { .state = 0, };
 	ip_timer_start_ms(ip, &t1, 1000);
-	while (!ip->stop) {
+
+	/* insert static ARP entry for our own interface */
+	if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), ip->ipv4_interface, 1, ip->mac) < 0) {
+		ip_fatal(ip, "ARP failed to insert initial static value");
+		return -1;
+	}
+	while (!ip_stack_finished(ip)) {
 			int need_sleep = 1;
-			if (ip_rx_packet_handler(ip))
+			if (ip_rx_packet_handler(ip) > 0)
 				need_sleep = 0;
-			if (ip_tx_state_machine(ip))
+			if (ip_arp_state_machine(ip) > 0)
+				need_sleep = 0;
+			if (ip_tx_state_machine(ip) > 0)
 				need_sleep = 0;
 			if (ip_timer_expired(ip, &t1)) {
 				ip_timer_reset_ms(ip, &t1, 1000);
@@ -1372,23 +1498,23 @@ static int ip_stack(ip_stack_t *ip) {
 				const uint32_t ipv4_dest = IPV4(127, 0, 0, 1);
 				//const uint32_t ipv4_dest = IPV4(192, 168, 1, 254);
 				if (ip_arp_who_has_req(ip, ipv4_dest) < 0) {
-					ip_error(ip, "ARP who has failed");
+					ip_error(ip, "ARP who-has failed");
 				}
 
 				uint8_t hello[] = "Hello, World!";
 				size_t hello_len = sizeof (hello);
 
-				ip_udp_tx(ip, ip->ipv4_interface, ipv4_dest, 2000, 2001, hello, hello_len);
+				if (ip_udp_tx(ip, ip->ipv4_interface, ipv4_dest, 2000, 2001, hello, hello_len) < 0) {
+					ip_error(ip, "UDP TX failed");
+				}
 			}
 			if (need_sleep) {
 				long sleep_ms = 1;
 				(void)ip_sleep(ip, &sleep_ms);
 			}
 	}
-	return 0;
+	return ip->fatal ? -1 : 0;
 }
-
-#define ip_test(T) (assert(T), (void)fprintf(stderr, "pass = %s\n", # T))
 
 static int ip_tests(void) {
 	if (!IP_DEBUG)
@@ -1551,7 +1677,7 @@ static int ip_options_set(ip_options_t *os, size_t olen, char *kv, FILE *error) 
 		}
 		break; 
 	}
-	case IP_OPTIONS_IPV4_E: {
+	case IP_OPTIONS_IPV4_E: { /* Note that this is not a full / proper IPv4 address parser, and IPv6 is right out */
 		int v4[4] = { 0, };
 		if (sscanf(v, "%i.%i.%i.%i", &v4[0], &v4[1], &v4[2], &v4[3]) != 4) {
 			if (error)

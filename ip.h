@@ -137,4 +137,15 @@ enum {
 	IP_DHCP_MAGIC_COOKIE = 0x63825363ul,
 };
 
+typedef struct {
+	uint16_t transaction_id;
+	uint16_t flags; /* See: https://en.wikipedia.org/wiki/Domain_Name_System#DNS_message_format */
+	uint16_t num_of_questions;
+	uint16_t num_of_answers;
+	uint16_t num_of_authority_rrs;
+	uint16_t num_of_additional_rrs;
+} ip_dns_t;
+
+#define IP_DNS_HEADER_BYTE_COUNT (12)
+
 #endif
