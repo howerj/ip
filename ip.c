@@ -117,7 +117,7 @@ typedef struct {
 	uint32_t ipv4_interface, ipv4_default_gateway, ipv4_netmask;
 	uint8_t mac[6];
 	long ipv4_ttl;
-	uint16_t ip_id;
+	uint16_t ip_id; /* IP Id field, increments each send */
 
 	ip_arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
 	unsigned long arp_cache_timeout_ms;
@@ -126,6 +126,66 @@ typedef struct {
 	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
 	long log_level; /* level to log at */
 } ip_stack_t;
+
+struct ip_queue_element {
+	struct ip_queue_element *next; /* next element in free-list */
+	uint8_t *buf; /* buffer, length is common to all elements in queue_t */
+};
+
+typedef struct ip_queue_element ip_queue_element_t;
+
+typedef struct {
+	ip_queue_element_t *free; /* free-list */
+	size_t queue_length, /* total length of queue */
+	       used,  /* number of elements used in queue */
+	       element_buf_length; /* length of the buffer in each queue */
+} ip_queue_t;
+
+static int ip_queue_init(ip_queue_t *q, ip_queue_element_t *es, size_t elements, uint8_t *arena, size_t arena_len) {
+	assert(q);
+	assert(es);
+	assert(arena);
+	/*assert((((uintptr_t)arena) & 0xF) == 0); // We could align arena up ourselves, and decrement arena_len */
+	memset(q, 0, sizeof *q);
+	memset(arena, 0, arena_len);
+	memset(es, 0, sizeof (*es) * elements);
+	size_t chunk = !elements || !arena_len ? 0 : arena_len / elements;
+	if (chunk < 16) /* min align is 16 bytes */
+		return -1;
+	chunk += 0xF;
+	chunk &= ~0xFull;
+	q->used = 0;
+	q->element_buf_length = chunk;
+	q->queue_length = elements;
+	q->free = &es[0];
+	for (size_t i = 0; i < elements; i++) {
+		ip_queue_element_t *e = &es[i];
+		e->next = i < (elements - 1) ? &es[i + 1] : NULL;
+		assert((chunk * i) < arena_len);
+		e->buf = &arena[chunk * i];
+	}
+	return 0;
+}
+
+static ip_queue_element_t *ip_queue_get(ip_queue_t *q) {
+	assert(q);
+	ip_queue_element_t *r = q->free;
+	if (r) {
+		q->free = r->next;
+		assert(q->used < q->queue_length);
+		q->used++;
+	}
+	return r;
+}
+
+static void ip_queue_put(ip_queue_t *q, ip_queue_element_t *e) {
+	assert(q);
+	assert(e);
+	e->next = q->free;
+	q->free = e;
+	assert(q->used > 0);
+	q->used--;
+}
 
 enum { IP_LOG_FATAL, IP_LOG_ERROR, IP_LOG_WARNING, IP_LOG_INFO, IP_LOG_DEBUG, };
 
@@ -783,14 +843,24 @@ static int ip_mac_to_string(const uint8_t *mac, size_t mac_len, char *buf, size_
 	return 0;
 }
 
+static int ip_arp_do_no_insert(const uint8_t mac[6]) {
+	assert(mac);
+	static const uint8_t broadcast[6] = IP_ETHERNET_BROADCAST_ADDRESS, empty[6] = IP_ETHERNET_EMPTY_ADDRESS;
+	if (!memcmp(mac, broadcast, 6))
+		return 1;
+	if (!memcmp(mac, empty, 6))
+		return 1;
+	return 0;
+}
+
 static int ip_arp_insert(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t len, const uint32_t ipv4, int static_addr, uint8_t mac[6]) {
 	assert(ip);
 	assert(arps);
 	assert(mac);
+	assert(IP_NELEMS(ip->arp_cache) < INT_MAX);
 	if (ip_arp_find(ip, arps, len, ipv4) >= 0)
 		return 0;
-	static const uint8_t broadcast[6] = IP_ETHERNET_BROADCAST_ADDRESS;
-	if (!memcmp(mac, broadcast, 6))
+	if (ip_arp_do_no_insert(mac))
 		return 0;
 	const int i = ip_arp_find_free(ip, arps, len);
 	if (i < 0) {
@@ -1043,7 +1113,6 @@ static long ip_ethernet_rx_cb(void *ethernet, uint8_t *buf, size_t buflen) {
         int r = recvfrom(e->fd, buf, buflen, 0, NULL, NULL);
 	if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 		return 0;
-	perror("rx? ");
 	return r;
 }
 
@@ -1085,20 +1154,23 @@ static int ip_stack_deinit(ip_stack_t *ip) {
 
 static int ip_arp_state_machine(ip_stack_t *ip) {
 	assert(ip);
+	// TODO
 	return 0;
 }
 
 static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
 	assert(ip);
 	/* Send ARP Req -> Wait -> Send Message */
+	// TODO
 	return 0;
 }
 
-static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6]) {
+static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6], int op) {
 	assert(ip);
 	assert(tx);
 	assert(mac_src);
 	assert(mac_dst);
+	/*assert(op == 1 || op == 2);*/
 	ip_ethernet_t e = { .type = IP_ETHERNET_TYPE_ARP, };
 	memcpy(e.source, mac_src, 6);
 	memcpy(e.destination, mac_dst, 6);
@@ -1112,7 +1184,7 @@ static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ip
 		.proto = 0x0800,
 		.hlen = 6,
 		.plen = 4,
-		.op = 1, /* request = 1, response = 2 */
+		.op = op, /* request = 1, response = 2 */
 	};
 	memcpy(a.shw, mac_src, 6);
 	memcpy(a.thw, mac_dst, 6);
@@ -1126,27 +1198,29 @@ static int ip_arp_format(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ip
 	return r1 + r2;
 }
 
-static int ip_arp_req(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6]) {
+static int ip_arp_req(ip_stack_t *ip, uint8_t *tx, size_t tx_len, uint32_t ipv4_src, uint32_t ipv4_dst, const uint8_t mac_src[6], const uint8_t mac_dst[6], int op) {
 	assert(ip);
 	assert(tx);
 	assert(mac_src);
 	assert(mac_dst);
-	const int len = ip_arp_format(ip, tx, tx_len, ipv4_src, ipv4_dst, mac_src, mac_dst);
+	const int len = ip_arp_format(ip, tx, tx_len, ipv4_src, ipv4_dst, mac_src, mac_dst, op);
 	if (len < 0)
 		return -1;
 	return ip_ethernet_tx(ip, tx, len);
 }
 
-// TODO: Fix ARP mechanism
+// TODO: Options to disable ARP and sending Ethernet packets generally
 static int ip_arp_who_has_req(ip_stack_t *ip, uint32_t ipv4) {
 	assert(ip);
 	static const uint8_t mac_dst[6] = IP_ETHERNET_BROADCAST_ADDRESS;
-	return ip_arp_req(ip, ip->tx, ip->tx_len, ip->ipv4_interface, ipv4, ip->mac, mac_dst);
+	uint8_t buf[128];
+	return ip_arp_req(ip, buf, sizeof(buf), ip->ipv4_interface, ipv4, ip->mac, mac_dst, 1);
 }
 
 static int ip_arp_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	assert(ip);
 	assert(packet);
+	int r = 0;
 	ip_arp_t arp = { .hw = 0, };
 	if (ip_arp_header_serdes(&arp, packet, len, 0) < 0) {
 		ip_error(ip, "ARP packet deserialize failed");
@@ -1169,21 +1243,27 @@ static int ip_arp_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 		ip_info(ip, "unknown ARP `plen` field: %d", arp.plen);
 		return 0;
 	}
-	if (arp.op != 2) {
-		/* does not matter */
-	}
 	if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), arp.sp, 0, arp.shw) < 0) {
 		ip_error(ip, "ARP insert failed");
-		return -1;
+		r = -1;
+	}
+	if (arp.op == 1) {
+		if (arp.tp == ip->ipv4_interface) { /* They are after us! */
+			uint8_t buf[128];
+			if (ip_arp_req(ip, buf, sizeof(buf), ip->ipv4_interface, arp.sp, ip->mac, arp.shw, 2) < 0) {
+				ip_error(ip, "ARP Response TX failed");
+				return -1;
+			}
+			return r;
+		}
 	}
 	/* We could filter out our own address, but it should not matter */
 	if (ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), arp.tp, 0, arp.thw) < 0) {
 		ip_error(ip, "ARP insert failed");
-		return -1;
+		r = -1;
 	}
-	return 0;
+	return r;
 }
-
 
 static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	assert(ip);
@@ -1250,21 +1330,19 @@ static int ip_rx_packet_handler(ip_stack_t *ip) { /* return 1 if work has been d
 	switch (e.type) {
 	case IP_ETHERNET_TYPE_IPV4: {
 		ip_debug(ip, "ipv4 packet received");
+		ip_dump("IPv4 PKT", &ip->rx[s], r - s);
 		break;
 	}
 	case IP_ETHERNET_TYPE_ARP: {
 		ip_debug(ip, "arp packet received");
 		assert((r - s) <= r);
-		/*ip_dump("ARP PKT", &ip->rx[s], r - s);*/
+		ip_dump("ARP PKT", &ip->rx[s], r - s);
 		ip_arp_cb(ip, &ip->rx[s], r - s);
-		break;
-	}
-	case IP_ETHERNET_TYPE_RARP: {
-		ip_debug(ip, "rarp packet received");
 		break;
 	}
 	case IP_ETHERNET_TYPE_IPV6: {
 		ip_debug(ip, "ipv6 packet received");
+		ip_dump("IPv6 PKT", &ip->rx[s], r - s);
 		break;
 	}
 	default:
@@ -1279,6 +1357,7 @@ static int ip_stack(ip_stack_t *ip) {
 	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
 	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
 	// TODO: ARP state-machine WAIT -> REQUEST -> RESPONSE -> WAIT, handle timeouts, retry
+	// TODO: Generic packet queue, waiting on ARP queue, ...
 	ip_timer_t t1 = { .state = 0, };
 	ip_timer_start_ms(ip, &t1, 1000);
 	while (!ip->stop) {
@@ -1309,10 +1388,38 @@ static int ip_stack(ip_stack_t *ip) {
 	return 0;
 }
 
+#define ip_test(T) (assert(T), (void)fprintf(stderr, "pass = %s\n", # T))
+
 static int ip_tests(void) {
 	if (!IP_DEBUG)
 		return 0;
-	// TODO: Assertion based unit tests
+	uint8_t arena[512];
+	ip_queue_element_t elements[16];
+	ip_queue_t queue, *q = &queue;
+	int r = ip_queue_init(q, &elements[0], IP_NELEMS(elements), arena, sizeof (arena));
+	assert(r == 0);
+
+	ip_queue_element_t *q1 = ip_queue_get(q), *q2 = ip_queue_get(q), *q3 = ip_queue_get(q);
+	assert(q1);
+	assert(q1);
+	assert(q2);
+	assert(q3);
+	assert(q1->buf);
+	assert(q2->buf);
+	assert(q3->buf);
+	assert(q1 != q2);
+	assert(q1 != q3);
+	assert(q->used == 3);
+	assert(q1->buf != q2->buf);
+	assert(q1->buf != q3->buf);
+	ip_queue_put(q, q2);
+	ip_queue_put(q, q3);
+
+	size_t i = 0;
+	for (i = 0;i < IP_NELEMS(elements); i++)
+		(void*)ip_queue_get(q);
+	assert(q->used == 16);
+
 	return 0;
 }
 

@@ -39,6 +39,7 @@ To Do / Plan:
   using this TCP/IP stack.
 * [ ] integrate with <https://github.com/howerj/tftp>, get it running using
   this UDP/IP stack.
+* [ ] Bad link detection (same IP assigned to multiple MACs, etcetera).
 * [ ] port to <https://github.com/howerj/subleq-network>.
 * [ ] port to an OS of my own design?
 * [ ] Turn into header only library?
