@@ -70,6 +70,10 @@
 #define CONFIG_IP_PRINT_ENABLE (1)
 #endif
 
+#ifndef CONFIG_IP_QUEUE_DEPTH
+#define CONFIG_IP_QUEUE_DEPTH (16)
+#endif
+
 #ifdef NDEBUG
 #define IP_DEBUG (0)
 #else
@@ -109,6 +113,32 @@ typedef struct {
 
 #define IP_ARP_CACHE_ENTRY_BYTE_COUNT (4 + 4 + 6 + 1)
 
+struct ip_queue_element {
+	struct ip_queue_element *next; /* next element in free-list */
+	uint8_t *buf; /* buffer, what wondrous things will you store here? */
+	size_t buf_len, /* length of the buffer, obvs */
+	       used; /* set by user - that means you! Do not exceed buf_len, do not bounce. */
+};
+
+typedef struct ip_queue_element ip_queue_element_t;
+
+/* There are many different allocations strategies that could be done
+ * in order to make these queues as efficient as possible, for example the
+ * queue elements could be a Flexible Array Member. This unfortunately makes
+ * static allocation non-portable (and generate a bunch of warnings). We could
+ * go further and allocate the buffer after the elements and allocate one big
+ * slab. This has advantages (fewer memory allocations, only one allocate and
+ * free functions, it is clear who owns what, fewer pointers), but also
+ * disadvantages (it is technically not allowed, alignment issues, we would
+ * need to know all buffer sizes at allocation time). For a low level language
+ * C does not make it easy to allocate memory exactly how you would like it
+ * whilst still conforming to the language. */
+typedef struct {
+	ip_queue_element_t *head, *tail;
+	size_t queue_length; /* total length of queue */
+	int used;  /* number of elements used in queue */
+} ip_queue_t;
+
 typedef struct {
 	int (*os_time_ms)(void *os_time, long *time_ms);
 	int (*os_sleep_ms)(void *os_sleep, long *sleep_ms);
@@ -119,10 +149,14 @@ typedef struct {
 	     *ethernet, /* Ethernet interface handle */
 	     *error;    /* Error stream, most likely `stderr` */
 
-	uint8_t *rx, *tx; /* packet buffers */
+	uint8_t *rx, *tx; /* packet buffers; these are always available, but should not be used to pass packets around */
 	size_t rx_len, tx_len;
+	ip_queue_t q; /* packets buffers that can be passed around */
+	ip_queue_element_t qs[CONFIG_IP_QUEUE_DEPTH];
 
-	uint32_t ipv4_interface, ipv4_default_gateway, ipv4_netmask;
+	uint32_t ipv4_interface, 
+		 ipv4_default_gateway, 
+		 ipv4_netmask;
 	long ipv4_ttl;
 	uint8_t mac[6];
 	uint16_t ip_id; /* IP Id field, increments each send */
@@ -131,30 +165,14 @@ typedef struct {
 	unsigned long arp_cache_timeout_ms;
 	uint32_t arp_ipv4; /* IP address we want to link with a MAC addr */
 	int arp_state, /* ARP state machine */
-	    arp_retries,
+	    arp_retries, /* Number of times to retry an ARP request */
 	    arp_opts; /* ARP options */
-	uint8_t *arp_buf;
-	size_t arp_buf_sz;
-	ip_timer_t arp_timer;
+	ip_timer_t arp_timer; /* ARP retry timer */
 
 	int fatal; /* fatal error occurred, we should exit gracefully */
 	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
 	long log_level; /* level to log at */
 } ip_stack_t;
-
-struct ip_queue_element {
-	struct ip_queue_element *next; /* next element in free-list */
-	uint8_t *buf; /* buffer, length is common to all elements in queue_t */
-};
-
-typedef struct ip_queue_element ip_queue_element_t;
-
-typedef struct {
-	ip_queue_element_t *free; /* free-list */
-	size_t queue_length, /* total length of queue */
-	       used,  /* number of elements used in queue */
-	       element_buf_length; /* length of the buffer in each queue */
-} ip_queue_t;
 
 static int ip_queue_init(ip_queue_t *q, ip_queue_element_t *es, size_t elements, uint8_t *arena, size_t arena_len) {
 	assert(q);
@@ -170,35 +188,53 @@ static int ip_queue_init(ip_queue_t *q, ip_queue_element_t *es, size_t elements,
 	chunk += 0xF;
 	chunk &= ~0xFull;
 	q->used = 0;
-	q->element_buf_length = chunk;
 	q->queue_length = elements;
-	q->free = &es[0];
+	q->head = &es[0];
+	q->tail = &es[elements - 1];
 	for (size_t i = 0; i < elements; i++) {
 		ip_queue_element_t *e = &es[i];
 		e->next = i < (elements - 1) ? &es[i + 1] : NULL;
 		assert((chunk * i) < arena_len);
 		e->buf = &arena[chunk * i];
+		e->buf_len = chunk;
 	}
 	return 0;
 }
 
+static int ip_queue_is_empty(ip_queue_t *q) {
+	assert(q);
+	return q->head == NULL;
+}
+
+// TODO: Selectable FIFO and FILO
 static ip_queue_element_t *ip_queue_get(ip_queue_t *q) {
 	assert(q);
-	ip_queue_element_t *r = q->free;
-	if (r) {
-		q->free = r->next;
-		assert(q->used < q->queue_length);
-		q->used++;
-	}
+	if (ip_queue_is_empty(q))
+		return NULL;
+	ip_queue_element_t *r = q->head;
+	q->head = q->head->next;
+	if (q->head == NULL)
+		q->tail = NULL;
+	/*assert(q->used < q->queue_length);*/
+	q->used++;
+	r->next = NULL;
 	return r;
 }
 
 static void ip_queue_put(ip_queue_t *q, ip_queue_element_t *e) {
 	assert(q);
 	assert(e);
-	e->next = q->free;
-	q->free = e;
-	assert(q->used > 0);
+	if (ip_queue_is_empty(q)) {
+		q->tail = e;
+		q->head = e;
+		/*assert(q->used > 0);*/
+		q->used--;
+		return;
+	}
+	e->next = NULL;
+	q->tail->next = e;
+	q->tail = e;
+	/*assert(q->used > 0);*/
 	q->used--;
 }
 
@@ -713,7 +749,6 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	assert(udp);
 	assert(buf);
 	assert(ipv4);
-
 	const size_t pkt_len = buf_len + IP_UDP_HEADER_BYTE_COUNT + IP_HEADER_BYTE_COUNT + (IP_ETHERNET_HEADER_BYTE_COUNT * !!e);
 
 	if (pkt_len > tx_len)
@@ -755,44 +790,12 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	return pos;
 }
 
-static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport, uint16_t tport, uint8_t *buf, size_t buf_len) {
+static int ip_make_arp_request_to_arp_state_machine(ip_stack_t *ip, uint32_t ipv4) {
 	assert(ip);
-	assert(buf);
-
-	ip_ethernet_t e = {
-		.type = IP_ETHERNET_TYPE_IPV4,
-	};
-
-	//uint8_t mac[6] = IP_ETHERNET_BROADCAST_ADDRESS;
-	uint8_t mac[6] = IP_ETHERNET_EMPTY_ADDRESS;
-	memcpy(e.destination, mac, 6); // TODO: Fix, lookup address if known
-	memcpy(e.source, ip->mac, 6);
-
-	ip_ipv4_t ipv4 = {
-		.vhl = 0x45,
-		.ttl = ip->ipv4_ttl,
-		.tos = 0,
-		.len = buf_len + IP_HEADER_BYTE_COUNT + IP_UDP_HEADER_BYTE_COUNT,
-		.source = src,
-		.destination = dst,
-		.proto = 17,
-		.checksum = 0, /* `ip_udp_format` handles this */
-		.frags = 0,
-		.id = ip->ip_id++,
-	};
-	ip_udp_t udp = {
-		.source = sport,
-		.destination = tport,
-		.length = buf_len + IP_UDP_HEADER_BYTE_COUNT,
-		.checksum = 0, /* `ip_udp_format` handles this */
-	};
-	const int r = ip_udp_format(ip, &e, &ipv4, &udp, buf, buf_len, ip->tx, ip->tx_len);
-	if (r < 0) {
-		ip_error(ip, "UDP format failed");
+	if (ip->arp_ipv4)
 		return -1;
-	}
-	// TODO: Option to skip over ethernet header
-	return ip_ethernet_tx(ip, ip->tx, r);
+	ip->arp_ipv4 = ipv4;
+	return 0;
 }
 
 static int ip_arp_timed_out(ip_stack_t *ip, ip_arp_cache_entry_t *arp) {
@@ -949,7 +952,6 @@ static int ip_os_time(void *os_time, long *ms) {
 	if (clock_gettime(CLOCK_MONOTONIC, &t) < 0)
 		return -1;
 	unsigned long r = (t.tv_sec * 1000l) + (t.tv_nsec / 1000000l);
-	/*ip_printf("t=%ld\n", r);*/
 	*ms = r;
 	return 0;
 
@@ -1308,6 +1310,7 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 	case WAIT:
 		if (ip->arp_ipv4)
 			next = SEND;
+		// TODO: Check ARP queue
 		break;
 	case SEND:
 		next = RESP;
@@ -1356,6 +1359,76 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 		next = FATAL;
 	ip->arp_state = next;
 	return r;
+}
+
+static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport, uint16_t tport, uint8_t *buf, size_t buf_len) {
+	assert(ip);
+	assert(buf);
+
+	ip_ethernet_t e = {
+		.type = IP_ETHERNET_TYPE_IPV4,
+	};
+
+	int queue = 0;
+	const int idx = ip_arp_find(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), dst);
+	if (idx >= 0) {
+		assert(idx < (int)IP_NELEMS(ip->arp_cache));
+		ip_arp_cache_entry_t *arp = &ip->arp_cache[idx];
+		memcpy(e.destination, arp->mac, 6);
+	} else {
+		ip_warn(ip, "UDP TX missing MAC - queueing ARP");
+		static const uint8_t mac[6] = IP_ETHERNET_EMPTY_ADDRESS;
+		memcpy(e.destination, mac, 6);
+		queue = 1;
+	}
+	memcpy(e.source, ip->mac, 6);
+
+	ip_ipv4_t ipv4 = {
+		.vhl = 0x45,
+		.ttl = ip->ipv4_ttl,
+		.tos = 0,
+		.len = buf_len + IP_HEADER_BYTE_COUNT + IP_UDP_HEADER_BYTE_COUNT,
+		.source = src,
+		.destination = dst,
+		.proto = 17,
+		.checksum = 0, /* `ip_udp_format` handles this */
+		.frags = 0,
+		.id = ip->ip_id++,
+	};
+	ip_udp_t udp = {
+		.source = sport,
+		.destination = tport,
+		.length = buf_len + IP_UDP_HEADER_BYTE_COUNT,
+		.checksum = 0, /* `ip_udp_format` handles this */
+	};
+
+	uint8_t *tx_buf = ip->tx;
+	size_t tx_buf_len = ip->tx_len;
+
+#if 0
+	if (queue) { /* for whatever reason (missing MAC) we cannot send immediately */
+		ip_queue_element_t *e = ip_queue_get(&ip->q);
+		if (!e) {
+			ip_error(ip, "Ran out of queue space");
+			return -1;
+		}
+		tx_buf_len = e->buf_len;
+		tx_buf = e->buf;
+	}
+#endif
+	const int r = ip_udp_format(ip, &e, &ipv4, &udp, buf, buf_len, tx_buf, tx_buf_len);
+	if (r < 0) {
+		ip_error(ip, "UDP format failed");
+		return -1;
+	}
+	assert(r <= (int)tx_buf_len);
+
+	if (queue) {
+		//ip_queue_put(); // Put on to-ARP queue
+		return 0;
+	}
+
+	return ip_ethernet_tx(ip, tx_buf, r); // TODO: Option to skip over ethernet header
 }
 
 static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
@@ -1540,9 +1613,10 @@ static int ip_tests(void) {
 	assert(q1->buf != q3->buf);
 	ip_queue_put(q, q2);
 	ip_queue_put(q, q3);
+	ip_queue_put(q, q1);
 
 	size_t i = 0;
-	for (i = 0;i < IP_NELEMS(elements); i++)
+	for (i = 0;i < IP_NELEMS(elements)*2; i++)
 		(void*)ip_queue_get(q);
 	assert(q->used == 16);
 
@@ -1910,6 +1984,7 @@ int main(int argc, char **argv) {
 	/* Might need more buffers, or ways of partition these buffers, most
 	 * packets will not be 65536 bytes in size, or any of them... */
 	static uint8_t rx[CONFIG_IP_MAX_RX_BUF], tx[CONFIG_IP_MAX_TX_BUF];
+	static uint8_t arena[CONFIG_IP_MAX_RX_BUF * CONFIG_IP_QUEUE_DEPTH];
 	char *interface = "lo";
 
 	static ip_stack_t stack = { 
@@ -1930,6 +2005,11 @@ int main(int argc, char **argv) {
 		.mac                   =  CONFIG_IP_MAC_ADDR_DEFAULT,
 	}, *ip = &stack;
 	ip->error = stderr;
+
+	if (ip_queue_init(&ip->q, &ip->qs[0], IP_NELEMS(ip->qs), arena, sizeof (arena)) < 0) {
+		ip_fatal(ip, "queue init failed");
+		return 1;
+	}
 
 	ip_options_t kv[] = { /* We could also query environment variables */
 		{ .opt = "interface",  .v.s    = &interface,           .type = IP_OPTIONS_STRING_E, .help = "Set interface name", },
