@@ -135,7 +135,7 @@ typedef struct ip_queue_element ip_queue_element_t;
  * whilst still conforming to the language. */
 typedef struct {
 	ip_queue_element_t *head, *tail;
-	size_t queue_length; /* total length of queue */
+	/*size_t queue_length; // total length of queue */
 	int used;  /* number of elements used in queue */
 } ip_queue_t;
 
@@ -160,6 +160,7 @@ typedef struct {
 	long ipv4_ttl;
 	uint8_t mac[6];
 	uint16_t ip_id; /* IP Id field, increments each send */
+	ip_queue_t arpq; /* packets from `q` are put here until ARP is resolved */
 
 	ip_arp_cache_entry_t arp_cache[CONFIG_IP_ARP_CACHE_COUNT];
 	unsigned long arp_cache_timeout_ms;
@@ -188,7 +189,7 @@ static int ip_queue_init(ip_queue_t *q, ip_queue_element_t *es, size_t elements,
 	chunk += 0xF;
 	chunk &= ~0xFull;
 	q->used = 0;
-	q->queue_length = elements;
+	/*q->queue_length = elements;*/
 	q->head = &es[0];
 	q->tail = &es[elements - 1];
 	for (size_t i = 0; i < elements; i++) {
@@ -206,7 +207,7 @@ static int ip_queue_is_empty(ip_queue_t *q) {
 	return q->head == NULL;
 }
 
-// TODO: Selectable FIFO and FILO
+/* N.B. We could make FIFO/FILO behavior selectable */
 static ip_queue_element_t *ip_queue_get(ip_queue_t *q) {
 	assert(q);
 	if (ip_queue_is_empty(q))
@@ -219,6 +220,13 @@ static ip_queue_element_t *ip_queue_get(ip_queue_t *q) {
 	q->used++;
 	r->next = NULL;
 	return r;
+}
+
+static ip_queue_element_t *ip_queue_peek(ip_queue_t *q) {
+	assert(q);
+	if (ip_queue_is_empty(q))
+		return NULL;
+	return q->head;
 }
 
 static void ip_queue_put(ip_queue_t *q, ip_queue_element_t *e) {
@@ -777,19 +785,26 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	memcpy(&tx[pos], buf, buf_len);
 	pos += buf_len;
 	tx_len -= buf_len;
+	if (buf_len & 1) {
+		tx[pos] = 0;
+	}
 	const uint16_t ip_checksum = ip_checksum_finish(ip_checksum_add(&tx[ip_pos], IP_HEADER_BYTE_COUNT));
 	ip_htons_b(ip_checksum, &tx[ip_pos + 10]);
 	uint32_t udp_checksum = 0;
+	// TODO: Checksum is off by one
+	// TODO: For odd packets length the next octet needs setting to zero
 	udp_checksum += ipv4->source;
 	udp_checksum += ipv4->destination;
 	udp_checksum += ipv4->proto;
-	udp_checksum += buf_len + IP_UDP_HEADER_BYTE_COUNT;
-	udp_checksum += ip_checksum_add(&tx[udp_pos], IP_UDP_HEADER_BYTE_COUNT + buf_len);
+	udp_checksum += rudp;
+	udp_checksum += buf_len;
+	udp_checksum += ip_checksum_add(&tx[udp_pos], rudp + buf_len);
 	udp_checksum = ip_checksum_finish(udp_checksum);
 	ip_htons_b(udp_checksum, &tx[udp_pos + 6]);
 	return pos;
 }
 
+// TODO: Remove?
 static int ip_make_arp_request_to_arp_state_machine(ip_stack_t *ip, uint32_t ipv4) {
 	assert(ip);
 	if (ip->arp_ipv4)
@@ -960,6 +975,8 @@ static int ip_os_time(void *os_time, long *ms) {
 #error "OS Functions not implemented for platform"
 #endif
 
+// TODO: Under Linux the TAP interfaces are not going UP unless socat is run on
+// those interfaces as well, something must be missing
 #if CONFIG_IP_IFACE_METHOD == IP_IFACE_METHOD_PCAP
 
 #include <pcap.h>
@@ -1296,6 +1313,22 @@ static int ip_arp_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	return r;
 }
 
+/* If using Ethernet we have to map MAC addresses to IP addresses before we
+ * can send out packets (except broadcast packets). This means we cannot send
+ * out packets until an ARP request has been processed. If we were designing a
+ * networking stack from scratch we could get rid of the whole IP/MAC
+ * distinction and only use 128-bit IP addresses for everything (including
+ * ports!) which would greatly simplify things. Different parts of the stack
+ * are at awkward places, there are more headers and formats than there need
+ * to be, and more protocols, and they are at awkward levels. 
+ *
+ * The main difficulty in making a networking stack is not what it does, but the 
+ * cruft. There is so much cruft, even if they are the protocols are relatively 
+ * simple. Oh well, it is what it is, and will always be. 
+ *
+ * Networking protocols are one of the things that take forever to
+ * replace because they derive their utility from other people and machines
+ * using them, the only real solution is a time-machine. */
 static int ip_arp_state_machine(ip_stack_t *ip) {
 	assert(ip);
 
@@ -1307,11 +1340,14 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 	/* TODO: ARP options: Broadcast, Do not bother with ARP, pull from queue, block until ARP'ed */
 
 	switch (s) {
-	case WAIT:
-		if (ip->arp_ipv4)
+	case WAIT: {
+		ip_queue_element_t *req =  NULL;
+		if (ip->arp_ipv4) {
 			next = SEND;
-		// TODO: Check ARP queue
+		} else if ((req = ip_queue_peek(&ip->arpq))) { // TODO: Check ARP queue
+		}
 		break;
+	}
 	case SEND:
 		next = RESP;
 		r = 1;
@@ -1425,18 +1461,11 @@ static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport,
 
 	if (queue) {
 		//ip_queue_put(); // Put on to-ARP queue
-		return 0;
+		//return 0;
 	}
 
+	ip_info(ip, "ETH TX UDP");
 	return ip_ethernet_tx(ip, tx_buf, r); // TODO: Option to skip over ethernet header
-}
-
-static int ip_tx_state_machine(ip_stack_t *ip) { /* return 1 if work has been done */
-	assert(ip);
-	/* Send ARP Req -> Wait -> Send Message */
-	// TODO
-	enum { WAIT, ARP, TX, };
-	return 0;
 }
 
 static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
@@ -1464,7 +1493,7 @@ static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 	if (v4.ttl == 0) { /* do not care unless we are routing */
 		ip_warn(ip, "IPv4 TTL is zero"); /* Like tears in rain. Time to die. Or not in this case. */
 	}
-	// TODO: Handle fragments, 
+	// TODO: Handle fragments
 	switch (v4.proto) {
 	case IP_V4_PROTO_ICMP:
 		ip_debug(ip, "IPv4 ICMP Packet RX");
@@ -1473,6 +1502,7 @@ static int ip_ipv4_cb(ip_stack_t *ip, uint8_t *packet, size_t len) {
 		ip_debug(ip, "IPv4 TCP Packet RX");
 		break;
 	case IP_V4_PROTO_UDP:
+		// TODO: UDP checksum / parsing
 		ip_debug(ip, "IPv4 UDP Packet RX");
 		break;
 	default:
@@ -1563,13 +1593,11 @@ static int ip_stack(ip_stack_t *ip) {
 				need_sleep = 0;
 			if (ip_arp_state_machine(ip) > 0)
 				need_sleep = 0;
-			if (ip_tx_state_machine(ip) > 0)
-				need_sleep = 0;
 			if (ip_timer_expired(ip, &t1)) {
 				ip_timer_reset_ms(ip, &t1, 1000);
 
-				const uint32_t ipv4_dest = IPV4(127, 0, 0, 1);
-				//const uint32_t ipv4_dest = IPV4(192, 168, 1, 254);
+				//const uint32_t ipv4_dest = IPV4(127, 0, 0, 1);
+				const uint32_t ipv4_dest = IPV4(192, 168, 10, 1);
 				if (ip_arp_who_has_req(ip, ipv4_dest) < 0) {
 					ip_error(ip, "ARP who-has failed");
 				}

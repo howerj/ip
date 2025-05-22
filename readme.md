@@ -66,4 +66,4 @@ Some commands:
 	ip link set dev tap0 up
 	ip link set dev tap1 up
 	ip link set dev br0 up
-
+	socat -u TUN,tun-name=tap0,tun-type=tap /dev/null

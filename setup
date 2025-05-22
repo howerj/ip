@@ -1,0 +1,78 @@
+#!/bin/bash
+# This script is for testing only.
+#set -eux;
+DELETE=false;
+IF0=tap0
+IF1=tap1
+MAC0=C0:11:11:11:11:11
+MAC1=C0:22:22:22:22:22
+IP0=192.168.10.1
+IP1=192.168.10.2
+
+usage () {
+	echo "Usage: $0 ";
+	echo "Setup test network for <https://github.com/howerj/ip>, a TCP/IP stack";
+	echo "";
+	echo "Options:";
+	echo "";
+	echo "-d or --delete: delete Linux TAP interaces and bridges"
+	echo "-h or --help:   print this help and exit"
+	echo "-0:             run instance of first 'ip'"
+	echo "-1:             run instance of second 'ip'"
+	echo "-s0:            run instance of socat on first interface"
+	echo "-s1:            run instance of socat on second interface"
+	echo ""
+}
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+	-d|--delete)
+		DELETE=true;
+		shift;
+		;;
+	-h|--help)
+		usage;
+		exit;
+		;;
+	-0)
+		make ip
+		./ip -vvv -o interface=${IF0} -o mac=${MAC0} -o ip=${IP0}
+		exit;
+		;;
+	-1)
+		make ip
+		./ip -vvv -o interface=${IF1} -o mac=${MAC1} -o ip=${IP1}
+		exit;
+		;;
+	-s0)
+		socat -u TUN,tun-name=${IF0},tun-type=tap /dev/null
+		exit
+		;;
+	-s1)
+		socat -u TUN,tun-name=${IF1},tun-type=tap /dev/null
+		exit
+		;;
+	*)
+	echo "Invalid option: $1"
+		usage;
+		;;
+	esac
+done
+
+if [ $DELETE = "true" ]; then
+	ip link delete br0
+	ip link delete ${IF0}
+	ip link delete ${IF1}
+	exit;
+fi;
+
+ip link add br0 type bridge;
+ip tuntap add mode tap name ${IF0};
+ip tuntap add mode tap name ${IF1};
+ip link set address ${MAC0} ${IF0}
+ip link set address ${MAC1} ${IF1}
+ip link set ${IF0} master br0;
+ip link set ${IF1} master br0;
+ip link set dev ${IF0} up;
+ip link set dev ${IF1} up;
+ip link set dev br0 up;
