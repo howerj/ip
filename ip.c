@@ -757,9 +757,9 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	assert(udp);
 	assert(buf);
 	assert(ipv4);
-	const size_t pkt_len = buf_len + IP_UDP_HEADER_BYTE_COUNT + IP_HEADER_BYTE_COUNT + (IP_ETHERNET_HEADER_BYTE_COUNT * !!e);
+	const size_t pkt_len = buf_len + (buf_len & 1) + IP_UDP_HEADER_BYTE_COUNT + IP_HEADER_BYTE_COUNT + (IP_ETHERNET_HEADER_BYTE_COUNT * !!e);
 
-	if (pkt_len > tx_len)
+	if (pkt_len > tx_len) /* pkt_len is rounded up so it 2-octet aligned */
 		return -1;
 
 	size_t pos = 0, ip_pos = 0, udp_pos = 0;
@@ -791,10 +791,10 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	const uint16_t ip_checksum = ip_checksum_finish(ip_checksum_add(&tx[ip_pos], IP_HEADER_BYTE_COUNT));
 	ip_htons_b(ip_checksum, &tx[ip_pos + 10]);
 	uint32_t udp_checksum = 0;
-	// TODO: Checksum is off by one
-	// TODO: For odd packets length the next octet needs setting to zero
-	udp_checksum += ipv4->source;
-	udp_checksum += ipv4->destination;
+	udp_checksum += ipv4->source & 0xFFFF;
+	udp_checksum += ipv4->source >> 16;
+	udp_checksum += ipv4->destination & 0xFFFF;
+	udp_checksum += ipv4->destination >> 16;
 	udp_checksum += ipv4->proto;
 	udp_checksum += rudp;
 	udp_checksum += buf_len;
