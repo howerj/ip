@@ -804,15 +804,6 @@ static int ip_udp_format(ip_stack_t *ip, ip_ethernet_t *e, ip_ipv4_t *ipv4, ip_u
 	return pos;
 }
 
-// TODO: Remove?
-static int ip_make_arp_request_to_arp_state_machine(ip_stack_t *ip, uint32_t ipv4) {
-	assert(ip);
-	if (ip->arp_ipv4)
-		return -1;
-	ip->arp_ipv4 = ipv4;
-	return 0;
-}
-
 static int ip_arp_timed_out(ip_stack_t *ip, ip_arp_cache_entry_t *arp) {
 	assert(ip);
 	assert(arp);
@@ -833,6 +824,8 @@ static int ip_arp_find(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t 
 	for (size_t i = 0; i < len; i++) {
 		ip_arp_cache_entry_t *arp = &arps[i];
 		if (arp->ipv4 == ipv4) {
+			if (arp->state == IP_ARP_CACHE_ENTRY_STATIC)
+				return i;
 			if (ip_arp_timed_out(ip, arp)) {
 				ip_arp_clear(arp);
 				continue;
@@ -1335,16 +1328,26 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 	enum { WAIT, SEND, RESP, FATAL, };
 
 	const int s = ip->arp_state;
-	int next = s, r = 0;
+	int next = s, r = 0, putback = 0;
+	ip_queue_element_t *req =  NULL;
 
 	/* TODO: ARP options: Broadcast, Do not bother with ARP, pull from queue, block until ARP'ed */
 
 	switch (s) {
 	case WAIT: {
-		ip_queue_element_t *req =  NULL;
 		if (ip->arp_ipv4) {
 			next = SEND;
-		} else if ((req = ip_queue_peek(&ip->arpq))) { // TODO: Check ARP queue
+		} else if ((req = ip_queue_peek(&ip->arpq))) {
+			ip_ipv4_t ipv4 = { 0, };
+			if (ip_ipv4_header_serdes(&ipv4, &req->buf[IP_ETHERNET_HEADER_BYTE_COUNT], req->buf_len - IP_ETHERNET_HEADER_BYTE_COUNT, 0) < 0 || !ipv4.destination) {
+				ip_error(ip, "ARP IP SERDES failed");
+				putback = 1;
+				break;
+			}
+			ip->arp_ipv4 = ipv4.destination;
+			char buf[128];
+			(void)ip_v4addr_to_string(ip->arp_ipv4, buf, sizeof (buf));
+			ip_debug(ip, "ARP IP:  %s\n", buf);
 		}
 		break;
 	}
@@ -1355,9 +1358,10 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 			ip_error(ip, "ARP TX failed");
 			next = SEND;
 		}
-		if (ip_timer_start_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_CACHE_TIMEOUT_MS) < 0) {
+		if (ip_timer_start_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_TIMEOUT_MS) < 0) {
 			ip_fatal(ip, "ARP timer start failed");
 			r = -1;
+			putback = 1;
 		}
 		ip->arp_retries = 0;
 		break;
@@ -1366,10 +1370,12 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 		if (found >= 0) {
 			ip->arp_ipv4 = 0;
 			next = WAIT;
+			putback = 1;
 		} else if (ip_timer_expired(ip, &ip->arp_timer)) {
-			if (ip_timer_reset_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_CACHE_TIMEOUT_MS) < 0) {
+			if (ip_timer_reset_ms(ip, &ip->arp_timer, CONFIG_IP_ARP_TIMEOUT_MS) < 0) {
 				ip_fatal(ip, "ARP timer failed");
 				r = -1;
+				putback = 1;
 				break;
 			}
 			ip->arp_retries++;
@@ -1377,6 +1383,7 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 			if (ip->arp_retries >= CONFIG_IP_ARP_RETRY_COUNT) {
 				ip_error(ip, "ARP failed to resolve address %lu", (unsigned long)ip->arp_ipv4);
 				next = WAIT;
+				putback = 1;
 			} else {
 				ip_warn(ip, "ARP timer expired, retrying");
 			}
@@ -1391,6 +1398,17 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 		r = -1;
 		break;
 	}
+
+	if (putback) {
+		req = ip_queue_get(&ip->arpq);
+		if (!req) {
+			ip_fatal(ip, "ARP someone has stolen our queue element");
+			r = -1;
+		} else {
+			ip_queue_put(&ip->q, req);
+		}
+	}
+
 	if (ip->fatal)
 		next = FATAL;
 	ip->arp_state = next;
@@ -1441,30 +1459,35 @@ static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport,
 	uint8_t *tx_buf = ip->tx;
 	size_t tx_buf_len = ip->tx_len;
 
-#if 0
+	ip_queue_element_t *ele = NULL;
 	if (queue) { /* for whatever reason (missing MAC) we cannot send immediately */
-		ip_queue_element_t *e = ip_queue_get(&ip->q);
-		if (!e) {
+		ele = ip_queue_get(&ip->q);
+		if (!ele) {
 			ip_error(ip, "Ran out of queue space");
 			return -1;
 		}
-		tx_buf_len = e->buf_len;
-		tx_buf = e->buf;
+		tx_buf_len = ele->buf_len;
+		tx_buf = ele->buf;
 	}
-#endif
+
 	const int r = ip_udp_format(ip, &e, &ipv4, &udp, buf, buf_len, tx_buf, tx_buf_len);
 	if (r < 0) {
+		if (ele)
+			ip_queue_put(&ip->q, ele);
 		ip_error(ip, "UDP format failed");
 		return -1;
 	}
 	assert(r <= (int)tx_buf_len);
 
-	if (queue) {
-		//ip_queue_put(); // Put on to-ARP queue
-		//return 0;
+	if (ele) {
+		ip_debug(ip, "ETH TX QUEUE ARTP");
+		assert(ele);
+		ele->used = r;
+		ip_queue_put(&ip->arpq, ele); /* Put on to-ARP queue */
+		return 0;
 	}
 
-	ip_info(ip, "ETH TX UDP");
+	ip_debug(ip, "ETH TX UDP");
 	return ip_ethernet_tx(ip, tx_buf, r); // TODO: Option to skip over ethernet header
 }
 
@@ -1572,6 +1595,11 @@ static inline int ip_stack_finished(ip_stack_t *ip) {
 
 static int ip_stack(ip_stack_t *ip) {
 	assert(ip);
+	ip->stop = 0;
+	if (ip->fatal) {
+		ip_error(ip, "calling ip_stack() with prior fatal error");
+		return -1;
+	}
 	// TODO: handle various state machine; ARP Req/Rsp, handle call backs,
 	// process packets, ICMP, DHCP Req/Rsp, DNS Req/Rsp, NTP Req/Rsp, ...
 	// TODO: ARP state-machine WAIT -> REQUEST -> RESPONSE -> WAIT, handle timeouts, retry
@@ -1587,6 +1615,12 @@ static int ip_stack(ip_stack_t *ip) {
 		ip_fatal(ip, "ARP failed to insert initial static value");
 		return -1;
 	}
+
+	// TODO: Remove these test ARP entries
+	uint8_t m0[6] = { 0xC0, 0x11, 0x11,   0x11, 0x11, 0x11, };
+	uint8_t m1[6] = { 0xC0, 0x22, 0x22,   0x22, 0x22, 0x22, };
+	ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), IPV4(192, 168, 10, 1), 1, m0);
+	ip_arp_insert(ip, ip->arp_cache, IP_NELEMS(ip->arp_cache), IPV4(192, 168, 10, 2), 1, m1);
 	while (!ip_stack_finished(ip)) {
 			int need_sleep = 1;
 			if (ip_rx_packet_handler(ip) > 0)
@@ -1596,8 +1630,8 @@ static int ip_stack(ip_stack_t *ip) {
 			if (ip_timer_expired(ip, &t1)) {
 				ip_timer_reset_ms(ip, &t1, 1000);
 
-				//const uint32_t ipv4_dest = IPV4(127, 0, 0, 1);
-				const uint32_t ipv4_dest = IPV4(192, 168, 10, 1);
+				uint8_t dst = (ip->ipv4_interface & 0xFF) == 1 ? 2 : 1;
+				const uint32_t ipv4_dest = IPV4(192, 168, 10, dst);
 				if (ip_arp_who_has_req(ip, ipv4_dest) < 0) {
 					ip_error(ip, "ARP who-has failed");
 				}
