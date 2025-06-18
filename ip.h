@@ -51,6 +51,17 @@ typedef struct {
 #define IP_HEADER_BYTE_COUNT (20)
 
 typedef struct {
+	uint32_t flags;
+	uint16_t length;
+	uint8_t next;
+	uint8_t hops;
+	uint8_t source[16];
+	uint8_t destination[16];
+} ip_ipv6_t;
+
+#define IP_V6_HEADER_BYTE_COUNT (4 + 2 + 1 + 1 + 16 + 16)
+
+typedef struct {
 	uint16_t hw;     /* 16 bit hw type */
 	uint16_t proto;  /* 16 bit protocol */
 	uint8_t  hlen;   /*  8 bit hw address length */
@@ -200,17 +211,17 @@ typedef struct {
 #define CONFIG_IP_ARP_RETRY_COUNT (3)
 #endif
 
-#ifndef CONFIG_IP_ARP_TIMEOUT_MS
+#ifndef CONFIG_IP_ARP_TIMEOUT_MS /* ARP request response timeout */
 #define CONFIG_IP_ARP_TIMEOUT_MS (1000)
 #endif
 
-#ifndef CONFIG_IP_TTL_DEFAULT /* Default IPv4 TTL */
+#ifndef CONFIG_IP_TTL_DEFAULT /* default IPv4 TTL */
 #define CONFIG_IP_TTL_DEFAULT (0x80u)
 #endif
 
-#define IP_IFACE_METHOD_PCAP (0)
-#define IP_IFACE_METHOD_LINUX_TAP (1)
-#define IP_IFACE_METHOD_CUSTOM (2)
+#define IP_IFACE_METHOD_PCAP      (0)  /* use libpcap to tx/rx IP packets */
+#define IP_IFACE_METHOD_LINUX_TAP (1)  /* use Linux TAP interface to tx/rx IP packets */
+#define IP_IFACE_METHOD_CUSTOM    (2)  /* use something *you* supply */
 
 #ifndef CONFIG_IP_IFACE_METHOD /* Interface method (PCAP = 0, Linux TUN = TODO) */
 #define CONFIG_IP_IFACE_METHOD (IP_IFACE_METHOD_PCAP)
@@ -289,13 +300,39 @@ typedef struct {
 	int used;  /* number of elements used in queue */
 } ip_queue_t;
 
+// TODO
+enum { /* TCP states */
+	IP_TCP_ST_CLOSED,      /* Inactive Connection, starting state */
+	IP_TCP_ST_LISTEN,      /* Wait for a connection request */
+	IP_TCP_ST_SYN_RCVD,    /* TCP server received first message in 3-way handshake, message had SYN set */
+	IP_TCP_ST_SYN_SENT,    /* TCP client sent first message with SYN set */
+	IP_TCP_ST_ESTABLISHED, /* Normal running, connection can send and receive data */
+	IP_TCP_ST_CLOSE_WAIT,  /* */
+	IP_TCP_ST_LAST_ACK,    /* */
+	IP_TCP_ST_FIN_WAIT_1,  /* */
+	IP_TCP_ST_FIN_WAIT_2,  /* */
+	IP_TCP_ST_CLOSING,     /* */
+	IP_TCP_ST_TIME_WAIT,   /* */
+};
+
+typedef struct { /* Transmission Control Block */
+	uint8_t window[4096];
+	uint16_t ack, req;
+	int state;
+	uint16_t port, remote_port;
+	uint32_t remote_ipv4;
+	// TODO
+} ip_tcp_tcb_t;
+
 typedef struct {
 	int (*os_time_ms)(void *os_time, long *time_ms);
 	int (*os_sleep_ms)(void *os_sleep, long *sleep_ms);
+	int (*os_random)(void *os_random, uint8_t *buf, size_t len);
 	long (*ethernet_rx)(void *ethernet, uint8_t *buf, size_t buflen);
 	long (*ethernet_tx)(void *ethernet, uint8_t *buf, size_t buflen);
 	void *os_time,  /* OS timer object, most likely NULL */
 	     *os_sleep, /* OS sleep object, most likely NULL */
+	     *random,   /* random object, most likely NULL */
 	     *ethernet, /* Ethernet interface handle */
 	     *error;    /* Error stream, most likely `stderr` */
 
@@ -308,7 +345,7 @@ typedef struct {
 		 ipv4_default_gateway, 
 		 ipv4_netmask;
 	long ipv4_ttl;
-	uint8_t mac[6];
+	uint8_t mac[6]; /* interface MAC */
 	uint16_t ip_id; /* IP Id field, increments each send */
 	ip_queue_t arpq; /* packets from `q` are put here until ARP is resolved */
 
@@ -324,6 +361,7 @@ typedef struct {
 	int stop; /* stop processing any data, return, if true (applies to `ip_stack` function). */
 	long log_level; /* level to log at */
 } ip_stack_t;
+
 
 static int ip_queue_init(ip_queue_t *q, ip_queue_element_t *es, size_t elements, uint8_t *arena, size_t arena_len) {
 	assert(q);
@@ -450,6 +488,13 @@ static inline int ip_dump(const char *banner, const unsigned char *m, size_t len
 		if (ip_printf("\n") < 0) return -1;
 	}
 	return 0;
+}
+
+static int ip_random(ip_stack_t *ip, uint8_t *buf, size_t len) {
+	assert(ip);
+	assert(ip->os_random);
+	assert(buf);
+	return ip->os_random(ip->random, buf, len);
 }
 
 static int ip_sleep(ip_stack_t *ip, long *sleep_ms) {
@@ -613,6 +658,8 @@ static inline void ip_u8_buf_serdes(uint8_t *x, uint8_t *buf, int serialize) {
 	*x = buf[0];
 }
 
+/* It might be an idea to return the number of items read/wrote, this would
+ * mean we would not have to manually track that count. */
 static inline void ip_u16_buf_serdes(uint16_t *x, uint8_t *buf, int serialize) {
 	assert(x);
 	assert(buf);
@@ -763,7 +810,22 @@ static int ip_ipv4_header_serdes(ip_ipv4_t *i, uint8_t *buf, size_t buf_len, int
 	ip_u16_buf_serdes(&i->checksum,    buf + 10, serialize);
 	ip_u32_buf_serdes(&i->source,      buf + 12, serialize);
 	ip_u32_buf_serdes(&i->destination, buf + 16, serialize);
-	return IP_HEADER_BYTE_COUNT;
+	return IP_HEADER_BYTE_COUNT; // TODO: Calculate larger header lengths / fail if header too big
+}
+
+static int ip_ipv6_header_serdes(ip_ipv6_t *i, uint8_t *buf, size_t buf_len, int serialize) {
+	assert(i);
+	assert(buf);
+	if (buf_len < IP_HEADER_BYTE_COUNT)
+		return -1;
+	ip_serdes_start("ipv6", buf_len, serialize);
+	ip_u32_buf_serdes(&i->flags,     buf +  0, serialize);
+	ip_u16_buf_serdes(&i->length,    buf +  4, serialize);
+	ip_u8_buf_serdes(&i->next,       buf +  6, serialize);
+	ip_u8_buf_serdes(&i->hops,       buf +  7, serialize);
+	ip_memory_serdes(i->source,      buf +  8, 16, serialize);
+	ip_memory_serdes(i->destination, buf + 24, 16, serialize);
+	return IP_V6_HEADER_BYTE_COUNT; // TODO: Calculate larger headers / fail if header too big
 }
 
 static int ip_arp_header_serdes(ip_arp_t *arp, uint8_t *buf, size_t buf_len, int serialize) {
@@ -1093,6 +1155,7 @@ static int ip_arp_rfind(ip_stack_t *ip, ip_arp_cache_entry_t *arps, const size_t
 #ifdef __linux__
 
 #include <unistd.h>
+#include <fcntl.h>
 
 static int ip_os_sleep(void *os_sleep, long *ms) {
 	IP_UNUSED(os_sleep);
@@ -1114,6 +1177,27 @@ static int ip_os_time(void *os_time, long *ms) {
 	return 0;
 
 }
+
+static int ip_random_bytes(void *os_random, uint8_t *buf, size_t xlen) {
+	assert(buf);
+	IP_UNUSED(os_random);
+	static int fd = -1; /* Not locked! */
+	if (fd == -1) {
+		fd = open("/dev/urandom", O_RDONLY);
+		if (fd < 0)
+			return -1;
+	}
+	assert(xlen <= INT_MAX);
+	assert(((int)xlen) >= 0);
+	return read(fd, buf, xlen);
+}
+
+static int ip_os_random(void *os_random, uint8_t *buf, size_t len) {
+	assert(buf);
+	IP_UNUSED(os_random);
+	return ip_random_bytes(NULL, buf, len);
+}
+
 #else
 #error "OS Functions not implemented for platform"
 #endif
@@ -2194,8 +2278,10 @@ static int ip_stack_info(ip_stack_t *ip, FILE *out) {
 	return 0;
 }
 
-// TODO: Command line interface (integrate <https://github.com/howerj/pickle>?
-// Or just make something quick and dirty?).
+/* We will eventually need to add a command line interface, or something like
+ * busybox, to allow multiple commands / applications to be run. It might be
+ * best to integrate <https://github.com/howerj/pickle>, but that would add
+ * a dependency and a lot more code, something quick and dirty might be best. */
 int main(int argc, char **argv) {
 	/* Might need more buffers, or ways of partition these buffers, most
 	 * packets will not be 65536 bytes in size, or any of them... */
@@ -2207,6 +2293,7 @@ int main(int argc, char **argv) {
 		.log_level             =  IP_LOG_ERROR,
 		.os_sleep_ms           =  ip_os_sleep,
 		.os_time_ms            =  ip_os_time,
+		.os_random             =  ip_os_random,
 		.ethernet_rx           =  ip_ethernet_rx_cb,
 		.ethernet_tx           =  ip_ethernet_tx_cb,
 		.ipv4_interface        =  CONFIG_IP_V4_DEFAULT,
@@ -2257,7 +2344,7 @@ int main(int argc, char **argv) {
 		ip_fatal(ip, "initialization failed");
 		return 1;
 	}
-	ip_info(ip, "initialization complete");
+	ip_info(ip, "initialization complete: running ip stack loop...");
 
 	if (ip_stack(ip) < 0) { /* This will block until finished */
 		ip_error(ip, "error running ip stack");
@@ -2266,7 +2353,7 @@ int main(int argc, char **argv) {
 	if (ip_stack_deinit(ip) < 0) {
 		ip_fatal(ip, "deinitialization failed");
 	}
-	ip_info(ip, "deinitialization complete");
+	ip_info(ip, "done");
 	return 0;
 }
 
