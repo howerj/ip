@@ -219,12 +219,16 @@ typedef struct {
 #define CONFIG_IP_TTL_DEFAULT (0x80u)
 #endif
 
+#ifndef CONFIG_IP_TCP_MAX_CONNECTIONS
+#define CONFIG_IP_TCP_MAX_CONNECTIONS (8)
+#endif
+
 #define IP_IFACE_METHOD_PCAP      (0)  /* use libpcap to tx/rx IP packets */
 #define IP_IFACE_METHOD_LINUX_TAP (1)  /* use Linux TAP interface to tx/rx IP packets */
 #define IP_IFACE_METHOD_CUSTOM    (2)  /* use something *you* supply */
 
 #ifndef CONFIG_IP_IFACE_METHOD /* Interface method (PCAP = 0, Linux TUN = TODO) */
-#define CONFIG_IP_IFACE_METHOD (IP_IFACE_METHOD_PCAP)
+#define CONFIG_IP_IFACE_METHOD (IP_IFACE_METHOD_LINUX_TAP)
 #endif
 
 #ifndef CONFIG_IP_PRINT_ENABLE /* Enable print functions */
@@ -232,7 +236,7 @@ typedef struct {
 #endif
 
 #ifndef CONFIG_IP_QUEUE_DEPTH
-#define CONFIG_IP_QUEUE_DEPTH (16)
+#define CONFIG_IP_QUEUE_DEPTH (32)
 #endif
 
 #ifdef NDEBUG
@@ -300,31 +304,79 @@ typedef struct {
 	int used;  /* number of elements used in queue */
 } ip_queue_t;
 
-// TODO
+/* From RFC 793, cool diagram.
+                                    
+                              +---------+ ---------\      active OPEN  
+                              |  CLOSED |            \    -----------  
+                              +---------+<---------\   \   create TCB  
+                                |     ^              \   \  snd SYN    
+                   passive OPEN |     |   CLOSE        \   \           
+                   ------------ |     | ----------       \   \         
+                    create TCB  |     | delete TCB         \   \       
+                                V     |                      \   \     
+                              +---------+            CLOSE    |    \   
+                              |  LISTEN |          ---------- |     |  
+                              +---------+          delete TCB |     |  
+                   rcv SYN      |     |     SEND              |     |  
+                  -----------   |     |    -------            |     V  
+ +---------+      snd SYN,ACK  /       \   snd SYN          +---------+
+ |         |<-----------------           ------------------>|         |
+ |   SYN   |                    rcv SYN                     |   SYN   |
+ |   RCVD  |<-----------------------------------------------|   SENT  |
+ |         |                    snd ACK                     |         |
+ |         |------------------           -------------------|         |
+ +---------+   rcv ACK of SYN  \       /  rcv SYN,ACK       +---------+
+   |           --------------   |     |   -----------                  
+   |                  x         |     |     snd ACK                    
+   |                            V     V                                
+   |  CLOSE                   +---------+                              
+   | -------                  |  ESTAB  |                              
+   | snd FIN                  +---------+                              
+   |                   CLOSE    |     |    rcv FIN                     
+   V                  -------   |     |    -------                     
+ +---------+          snd FIN  /       \   snd ACK          +---------+
+ |  FIN    |<-----------------           ------------------>|  CLOSE  |
+ | WAIT-1  |------------------                              |   WAIT  |
+ +---------+          rcv FIN  \                            +---------+
+   | rcv ACK of FIN   -------   |                            CLOSE  |  
+   | --------------   snd ACK   |                           ------- |  
+   V        x                   V                           snd FIN V  
+ +---------+                  +---------+                   +---------+
+ |FINWAIT-2|                  | CLOSING |                   | LAST-ACK|
+ +---------+                  +---------+                   +---------+
+   |                rcv ACK of FIN |                 rcv ACK of FIN |  
+   |  rcv FIN       -------------- |    Timeout=2MSL -------------- |  
+   |  -------              x       V    ------------        x       V  
+    \ snd ACK                 +---------+delete TCB         +---------+
+     ------------------------>|TIME WAIT|------------------>| CLOSED  |
+                              +---------+                   +---------+
+*/
+
 enum { /* TCP states */
 	IP_TCP_ST_CLOSED,      /* Inactive Connection, starting state */
 	IP_TCP_ST_LISTEN,      /* Wait for a connection request */
 	IP_TCP_ST_SYN_RCVD,    /* TCP server received first message in 3-way handshake, message had SYN set */
 	IP_TCP_ST_SYN_SENT,    /* TCP client sent first message with SYN set */
 	IP_TCP_ST_ESTABLISHED, /* Normal running, connection can send and receive data */
-	IP_TCP_ST_CLOSE_WAIT,  /* */
-	IP_TCP_ST_LAST_ACK,    /* */
-	IP_TCP_ST_FIN_WAIT_1,  /* */
-	IP_TCP_ST_FIN_WAIT_2,  /* */
-	IP_TCP_ST_CLOSING,     /* */
-	IP_TCP_ST_TIME_WAIT,   /* */
+	IP_TCP_ST_CLOSE_WAIT,  /* Local end point has rx'd a connection termination request, local end point needs to do active close*/
+	IP_TCP_ST_LAST_ACK,    /* Local end point has performed a passive close, and initiated active close */
+	IP_TCP_ST_FIN_WAIT_1,  /* First step of an active close */
+	IP_TCP_ST_FIN_WAIT_2,  /* The remote end point has send ack for previously sent termination req */
+	IP_TCP_ST_CLOSING,     /* The local end point is waiting for ack for connection termination req before going to time-wait */
+	IP_TCP_ST_TIME_WAIT,   /* The local end-point wait twice maximum segment lifetime before going to CLOSED to make sure remote ack rx'd*/
 };
 
-typedef struct { /* Transmission Control Block */
-	uint8_t window[4096];
-	uint16_t ack, req;
+typedef struct { /* TCP Transmission Control Block */
+	ip_queue_element_t *window; /* instead of `uint8_t window[4096]` we use queues as our generic allocator */
 	int state;
+	uint16_t ack, 
+		 req;
 	uint16_t port, remote_port;
 	uint32_t remote_ipv4;
-	// TODO
+	// TODO, fill out and add printing, we could also add a callback
 } ip_tcp_tcb_t;
 
-typedef struct {
+typedef struct { // TODO: Move to export portion of file
 	int (*os_time_ms)(void *os_time, long *time_ms);
 	int (*os_sleep_ms)(void *os_sleep, long *sleep_ms);
 	int (*os_random)(void *os_random, uint8_t *buf, size_t len);
@@ -340,6 +392,9 @@ typedef struct {
 	size_t rx_len, tx_len;
 	ip_queue_t q; /* packets buffers that can be passed around */
 	ip_queue_element_t qs[CONFIG_IP_QUEUE_DEPTH];
+
+	ip_tcp_tcb_t tcp[CONFIG_IP_TCP_MAX_CONNECTIONS];
+	// TODO: Callbacks for UDP? UDP connection manager?
 
 	uint32_t ipv4_interface, 
 		 ipv4_default_gateway, 
@@ -1350,11 +1405,13 @@ static int ip_linux_tap_init(ip_stack_t *ip, const char *name, ip_tap_t **handle
 		return -1;
 	}
 	if ((h->fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL))) == -1) {
+		ip_fatal(ip, "tap -- socket failed: %s", strerror(errno));
 		r = errno;
 		goto fail;
 	}
 	snprintf(ifreq.ifr_name, sizeof(ifreq.ifr_name), "%s", name);
-	if (ioctl(h->fd , SIOCGIFINDEX, &ifreq)) {
+	if (ioctl(h->fd, SIOCGIFINDEX, &ifreq) == -1) {
+		ip_fatal(ip, "tap -- could not get index: %s", strerror(errno));
 		r = errno;
 		goto fail;
 	}
@@ -1366,10 +1423,28 @@ static int ip_linux_tap_init(ip_stack_t *ip, const char *name, ip_tap_t **handle
 		.sll_pkttype = PACKET_HOST,
 	};
 
-	if (bind(h->fd , (struct sockaddr *)&saddr, sizeof(saddr)) == -1) {
+	if (bind(h->fd, (struct sockaddr *)&saddr, sizeof(saddr)) == -1) {
+		ip_fatal(ip, "tap -- bind failed: %s", strerror(errno));
 		r = errno;
 		goto fail;
 	}
+
+	/*const unsigned long flags = IFF_UP | IFF_PROMISC;
+	if (ioctl(h->fd, SIOCGIFFLAGS, &ifreq) == -1) {
+		ip_fatal(ip, "tap -- could not get flags: %s", strerror(errno));
+		r = errno;
+		goto fail;
+	}
+	ifreq.ifr_flags &= ~flags;
+	ifreq.ifr_flags |=  flags;
+	if (ioctl(h->fd, SIOCSIFFLAGS, &ifreq) == -1) {
+		ip_fatal(ip, "tap -- could not set flags: %s", strerror(errno));
+		r = errno;
+		goto fail;
+	}*/
+
+
+
 	*handle = h;
 	return 0;
 fail:
@@ -1378,7 +1453,7 @@ fail:
 		free(h);
 	}
 	*handle = NULL;
-	return r;
+	return r ? -1 : 0;
 }
 
 static int ip_linux_tap_deinit(ip_stack_t *ip, ip_tap_t *tap) {
@@ -1649,6 +1724,21 @@ static int ip_arp_state_machine(ip_stack_t *ip) {
 	return r;
 }
 
+static int ip_dns_state_machine(ip_stack_t *ip) {
+	assert(ip);
+	return 0; // TODO
+}
+
+static int ip_dhcp_state_machine(ip_stack_t *ip) {
+	assert(ip);
+	return 0; // TODO
+}
+
+static int ip_tcp_state_machine(ip_stack_t *ip) {
+	assert(ip);
+	return 0; // TODO
+}
+
 static int ip_udp_tx(ip_stack_t *ip, uint32_t src, uint32_t dst, uint16_t sport, uint16_t tport, uint8_t *buf, size_t buf_len) {
 	assert(ip);
 	assert(buf);
@@ -1863,7 +1953,13 @@ static int ip_stack(ip_stack_t *ip) {
 				need_sleep = 0;
 			if (ip_arp_state_machine(ip) > 0)
 				need_sleep = 0;
-			if (ip_timer_expired(ip, &t1)) {
+			if (ip_dns_state_machine(ip) > 0)
+				need_sleep = 0;
+			if (ip_dhcp_state_machine(ip) > 0)
+				need_sleep = 0;
+			if (ip_tcp_state_machine(ip) > 0)
+				need_sleep = 0;
+			if (ip_timer_expired(ip, &t1)) { /* Testing only */
 				ip_timer_reset_ms(ip, &t1, 1000);
 
 				uint8_t dst = (ip->ipv4_interface & 0xFF) == 1 ? 2 : 1;
